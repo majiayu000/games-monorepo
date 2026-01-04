@@ -1,0 +1,21 @@
+{
+  "name": "games-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:werewolf": "cd apps/werewolf/client && bun run dev",
+    "dev:poker": "cd apps/poker/client && bun run dev",
+    "build:werewolf": "cd apps/werewolf/nakama && bun run build",
+    "build:poker": "cd apps/poker/nakama && bun run build",
+    "test:werewolf": "cd apps/werewolf/nakama && bun test",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0"
+  }
+}
