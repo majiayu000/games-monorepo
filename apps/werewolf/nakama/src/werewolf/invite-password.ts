@@ -309,6 +309,32 @@ export function shouldDeleteMigratedSecretAfterAcceptConflict(
 }
 
 /**
+ * Whether a newly created legacy-migration secret should be compensated after a
+ * pre-commit failure (OCC conflict, history-cap read error, or non-version write).
+ *
+ * Delete when the durable row is terminal/gone, or when it still carries an
+ * inline password — that means our isPrivate migration never became durable, so
+ * the secret is undiscoverable by later cleanup if the invite expires without a
+ * successful rewrite.
+ */
+export function shouldCompensateStaleLegacyMigration(
+  winning: GameInvite | undefined,
+  now: number = Date.now()
+): boolean {
+  if (
+    shouldDeleteMigratedSecretAfterAcceptConflict(
+      winning?.status,
+      now,
+      winning?.expiresAt
+    )
+  ) {
+    return true;
+  }
+  // Pre-commit failure: durable row still has the inline password.
+  return !!(winning && legacyInlineInvitePassword(winning, now));
+}
+
+/**
  * Sender-side expiry must not wipe credentials while the receiver still needs
  * them: unexpired ACCEPTED (join retry) or still-live PENDING/SENDING rows that
  * were not successfully claimed EXPIRED (OCC left the actionable invite intact).

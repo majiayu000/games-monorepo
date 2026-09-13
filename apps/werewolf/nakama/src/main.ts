@@ -53,6 +53,7 @@ import {
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
   shouldBlockCancelForAcceptedReceiver,
+  shouldCompensateStaleLegacyMigration,
   shouldDeleteMigratedSecretAfterAcceptConflict,
   shouldDeleteSecretAfterHistoryCap,
   shouldDeleteSecretAfterSendRollback,
@@ -1000,6 +1001,12 @@ function rpcGetInvites(
           );
         }
       }
+      // Read-only polls must still migrate durable legacy inline passwords:
+      // stripping only the RPC response leaves owner-readable storage leaking
+      // the credential until some unrelated rewrite runs.
+      if (legacyInlineInvitePassword(invite, now)) {
+        needsWrite = true;
+      }
       // Pending both lists; accepted only on received (join-retry); never include password
       if (isInviteVisibleInGetInvites(invite, now, type === 'sent' ? 'sent' : 'received')) {
         validInvites.push(inviteForOwnerStorage(invite));
@@ -1863,8 +1870,8 @@ function writeInvites(
   const now = Date.now();
 
   // Rollout: migrate only unexpired pending/accepted legacy passwords.
-  // Track secrets we newly create so an OCC-losing write can compensate orphans
-  // without deleting credentials a concurrent accept still needs.
+  // Track secrets we newly create so any pre-commit failure can compensate
+  // orphans without deleting credentials a concurrent accept still needs.
   const newlyMigratedSecrets: Array<{ inviteId: string; senderId: string }> = [];
   for (const invite of invites) {
     const legacyPassword = legacyInlineInvitePassword(invite, now);
@@ -1881,72 +1888,71 @@ function writeInvites(
     }
   }
 
-  // Decide which history-capped secrets may be deleted, but do not delete yet.
-  const dropped = invitesDroppedByHistoryCap(invites, INVITE_HISTORY_CAP);
-  const secretsToDeleteAfterCommit: GameInvite[] = [];
-  if (dropped.length > 0) {
-    for (const drop of dropped) {
-      const counterpartUserId = type === 'sent' ? drop.receiverId : drop.senderId;
-      const counterpartType = type === 'sent' ? 'received' : 'sent';
-      // Sent-side EXPIRED private rows need receiver coordination even though
-      // inviteMayRetainPasswordSecret is already false (expiry elapsed).
-      if (
-        type === 'sent' &&
-        drop.status === InviteStatus.EXPIRED &&
-        drop.isPrivate === true
-      ) {
-        const receiverInvites = readInviteListOrThrow(
+  let secretsToDeleteAfterCommit: GameInvite[] = [];
+  try {
+    // Decide which history-capped secrets may be deleted, but do not delete yet.
+    const dropped = invitesDroppedByHistoryCap(invites, INVITE_HISTORY_CAP);
+    if (dropped.length > 0) {
+      for (const drop of dropped) {
+        const counterpartUserId = type === 'sent' ? drop.receiverId : drop.senderId;
+        const counterpartType = type === 'sent' ? 'received' : 'sent';
+        // Sent-side EXPIRED private rows need receiver coordination even though
+        // inviteMayRetainPasswordSecret is already false (expiry elapsed).
+        if (
+          type === 'sent' &&
+          drop.status === InviteStatus.EXPIRED &&
+          drop.isPrivate === true
+        ) {
+          const receiverInvites = readInviteListOrThrow(
+            nk,
+            counterpartUserId,
+            counterpartType
+          ).invites;
+          if (shouldDeleteSecretAfterSentExpiredHistoryCap(drop, receiverInvites, now)) {
+            secretsToDeleteAfterCommit.push(drop);
+          }
+          continue;
+        }
+        if (!inviteMayRetainPasswordSecret(drop, now)) {
+          secretsToDeleteAfterCommit.push(drop);
+          continue;
+        }
+        // Strict read: transient failure must not look like "counterpart gone".
+        const counterpartInvites = readInviteListOrThrow(
           nk,
           counterpartUserId,
           counterpartType
         ).invites;
-        if (shouldDeleteSecretAfterSentExpiredHistoryCap(drop, receiverInvites, now)) {
+        if (shouldDeleteSecretAfterHistoryCap(drop, counterpartInvites, now)) {
           secretsToDeleteAfterCommit.push(drop);
         }
-        continue;
-      }
-      if (!inviteMayRetainPasswordSecret(drop, now)) {
-        secretsToDeleteAfterCommit.push(drop);
-        continue;
-      }
-      // Strict read: transient failure must not look like "counterpart gone".
-      const counterpartInvites = readInviteListOrThrow(
-        nk,
-        counterpartUserId,
-        counterpartType
-      ).invites;
-      if (shouldDeleteSecretAfterHistoryCap(drop, counterpartInvites, now)) {
-        secretsToDeleteAfterCommit.push(drop);
       }
     }
-  }
 
-  // Keep last N regular rows; cleanup tombstones stay outside that budget.
-  // Strip passwords so storage API cannot leak them.
-  const recentInvites = invitesForOwnerHistoryStorage(invites, INVITE_HISTORY_CAP);
+    // Keep last N regular rows; cleanup tombstones stay outside that budget.
+    // Strip passwords so storage API cannot leak them.
+    const recentInvites = invitesForOwnerHistoryStorage(invites, INVITE_HISTORY_CAP);
 
-  const write: nkruntime.StorageWriteRequest = {
-    collection: INVITE_CONFIG.STORAGE_COLLECTION,
-    key,
-    userId,
-    value: { invites: recentInvites },
-    permissionRead: 1, // Owner only
-    permissionWrite: 0, // Server only
-  };
-  if (options && 'expectedVersion' in options) {
-    write.version = storageWriteVersionFor(options.expectedVersion ?? null);
-  }
+    const write: nkruntime.StorageWriteRequest = {
+      collection: INVITE_CONFIG.STORAGE_COLLECTION,
+      key,
+      userId,
+      value: { invites: recentInvites },
+      permissionRead: 1, // Owner only
+      permissionWrite: 0, // Server only
+    };
+    if (options && 'expectedVersion' in options) {
+      write.version = storageWriteVersionFor(options.expectedVersion ?? null);
+    }
 
-  try {
     nk.storageWrite([write]);
-  } catch (writeError) {
-    if (
-      newlyMigratedSecrets.length > 0 &&
-      isStorageVersionConflictError(writeError)
-    ) {
+  } catch (preCommitError) {
+    // Compensate on every pre-commit failure (OCC, history-cap counterpart
+    // read, non-version storageWrite) — not only version conflicts.
+    if (newlyMigratedSecrets.length > 0) {
       compensateStaleLegacyMigrations(nk, userId, type, newlyMigratedSecrets, now);
     }
-    throw writeError;
+    throw preCommitError;
   }
 
   // Eviction is durable — now delete secrets. On failure, retain a cleanup
@@ -2011,13 +2017,7 @@ function compensateStaleLegacyMigrations(
   }
   for (const { inviteId, senderId } of newlyMigratedSecrets) {
     const winning = durableInvites.find((invite) => invite.inviteId === inviteId);
-    if (
-      shouldDeleteMigratedSecretAfterAcceptConflict(
-        winning?.status,
-        now,
-        winning?.expiresAt
-      )
-    ) {
+    if (shouldCompensateStaleLegacyMigration(winning, now)) {
       try {
         deleteInvitePasswordSecret(nk, inviteId, senderId);
       } catch (deleteError) {

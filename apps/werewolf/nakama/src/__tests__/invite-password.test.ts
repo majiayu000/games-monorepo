@@ -34,6 +34,7 @@ import {
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
   shouldBlockCancelForAcceptedReceiver,
+  shouldCompensateStaleLegacyMigration,
   shouldDeleteMigratedSecretAfterAcceptConflict,
   shouldDeleteSecretAfterHistoryCap,
   shouldDeleteSecretAfterSendRollback,
@@ -442,6 +443,73 @@ describe('invite password attachment from matchSignal', () => {
       legacyInlineInvitePassword({ ...pending, expiresAt: now - 1, password: 'x' }, now)
     ).toBeUndefined();
     expect(inviteMayRetainPasswordSecret({ ...pending, status: InviteStatus.ACCEPTED }, now)).toBe(true);
+  });
+
+  it('get_invites read-only polls schedule rewrite for durable legacy passwords', () => {
+    const now = Date.now();
+    const legacyPending: GameInvite = {
+      inviteId: 'inv-poll-legacy',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+      password: 'still-inline',
+    };
+    // Stripping only the RPC response is insufficient — durable storage stays
+    // owner-readable until needsWrite triggers writeInvites migration.
+    let needsWrite = false;
+    if (legacyInlineInvitePassword(legacyPending, now)) {
+      needsWrite = true;
+    }
+    const responseRow = inviteForOwnerStorage(legacyPending);
+    expect(responseRow.password).toBeUndefined();
+    expect(needsWrite).toBe(true);
+    expect(legacyInlineInvitePassword(legacyPending, now)).toBe('still-inline');
+  });
+
+  it('stale-migration compensation rolls back when durable row still has inline password', () => {
+    const now = Date.now();
+    const durableLegacy: GameInvite = {
+      inviteId: 'inv-precommit',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+      password: 'legacy-inline',
+    };
+    // Pre-commit failure: migration created a secret but list write never stuck.
+    expect(shouldDeleteMigratedSecretAfterAcceptConflict(durableLegacy.status, now, durableLegacy.expiresAt)).toBe(
+      false
+    );
+    expect(shouldCompensateStaleLegacyMigration(durableLegacy, now)).toBe(true);
+
+    const migratedDurable: GameInvite = {
+      ...durableLegacy,
+      isPrivate: true,
+      password: undefined,
+    };
+    // Successful concurrent migration — keep the secret for join retry.
+    expect(shouldCompensateStaleLegacyMigration(migratedDurable, now)).toBe(false);
+    expect(
+      shouldCompensateStaleLegacyMigration(
+        { ...durableLegacy, status: InviteStatus.DECLINED, password: undefined },
+        now
+      )
+    ).toBe(true);
   });
 
   it('history cap deletes secrets only when no retryable counterpart remains', () => {
