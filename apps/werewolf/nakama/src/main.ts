@@ -15,7 +15,7 @@ declare var matchLoop: nkruntime.MatchHandler['matchLoop'];
 declare var matchTerminate: nkruntime.MatchHandler['matchTerminate'];
 declare var matchSignal: nkruntime.MatchHandler['matchSignal'];
 import {
-  UserStats, createInitialUserStats, calculateLevelInfo, calculateGameXP,
+  UserStats, createInitialUserStats, calculateLevelInfo,
   GameInvite, InviteStatus, INVITE_CONFIG, LevelInfo,
   // Achievement types
   AchievementId, AchievementCategory, AchievementRarity,
@@ -67,7 +67,6 @@ function InitModule(
   initializer.registerRpc('find_match', rpcFindMatch);
   initializer.registerRpc('list_matches', rpcListMatches);
   initializer.registerRpc('get_user_stats', rpcGetUserStats);
-  initializer.registerRpc('record_game_result', rpcRecordGameResult);
   // Friend invite system
   initializer.registerRpc('send_invite', rpcSendInvite);
   initializer.registerRpc('get_invites', rpcGetInvites);
@@ -82,7 +81,8 @@ function InitModule(
   // Replay system
   initializer.registerRpc('get_replays', rpcGetReplays);
   initializer.registerRpc('get_replay', rpcGetReplayById);
-  logger.info('Registered RPC endpoints: create_match, find_match, list_matches, get_user_stats, record_game_result, send_invite, get_invites, respond_invite, cancel_invite, search_users, get_achievements, update_achievements, get_leaderboard, get_replays, get_replay');
+  // Stats writes happen server-side in match_handler.recordGameStats (not via client RPC)
+  logger.info('Registered RPC endpoints: create_match, find_match, list_matches, get_user_stats, send_invite, get_invites, respond_invite, cancel_invite, search_users, get_achievements, update_achievements, get_leaderboard, get_replays, get_replay');
 
   // Register matchmaker callback
   initializer.registerMatchmakerMatched(onMatchmakerMatched);
@@ -367,205 +367,6 @@ function rpcGetUserStats(
 }
 
 /** Helper to get today's date string (YYYY-MM-DD) */
-function getTodayString(): string {
-  const now = new Date();
-  return now.toISOString().split('T')[0];
-}
-
-/**
- * RPC: Record game result (called by server after game ends)
- * This should be called internally by the match handler
- */
-function rpcRecordGameResult(
-  ctx: nkruntime.Context,
-  logger: nkruntime.Logger,
-  nk: nkruntime.Nakama,
-  payload: string
-): string {
-  if (!payload) {
-    return JSON.stringify({
-      success: false,
-      error: 'No payload provided',
-    });
-  }
-
-  try {
-    const data = JSON.parse(payload);
-    const { players, winner, sheriffId } = data;
-
-    if (!players || !Array.isArray(players)) {
-      return JSON.stringify({
-        success: false,
-        error: 'Invalid players data',
-      });
-    }
-
-    logger.info(`Recording game result for ${players.length} players, winner: ${winner}`);
-
-    const now = Date.now();
-    const today = getTodayString();
-    const writes: nkruntime.StorageWriteRequest[] = [];
-    const levelUpPlayers: Array<{ userId: string; oldLevel: number; newLevel: number; xpGained: number }> = [];
-
-    for (const player of players) {
-      const { userId, role, faction, isWinner, isAlive, isLover } = player;
-
-      // Read existing stats
-      let stats: UserStats;
-      try {
-        const objects = nk.storageRead([{
-          collection: STATS_COLLECTION,
-          key: STATS_KEY,
-          userId: userId,
-        }]);
-
-        if (objects.length > 0 && objects[0].value) {
-          stats = objects[0].value as UserStats;
-          // Migrate old stats that don't have level fields
-          if (stats.level === undefined) {
-            stats.level = 1;
-            stats.currentXP = 0;
-            stats.totalXP = 0;
-            stats.winStreak = 0;
-            stats.maxWinStreak = 0;
-            stats.lastWinDate = '';
-          }
-        } else {
-          stats = createInitialUserStats(userId);
-        }
-      } catch {
-        stats = createInitialUserStats(userId);
-      }
-
-      const oldLevel = stats.level || 1;
-      const wasSheriff = userId === sheriffId;
-      const isFirstWinOfDay = isWinner && stats.lastWinDate !== today;
-
-      // Update win streak
-      if (isWinner) {
-        stats.winStreak = (stats.winStreak || 0) + 1;
-        stats.maxWinStreak = Math.max(stats.maxWinStreak || 0, stats.winStreak);
-        stats.lastWinDate = today;
-      } else {
-        stats.winStreak = 0;
-      }
-
-      // Calculate XP gained
-      const xpGained = calculateGameXP({
-        won: isWinner,
-        survived: isAlive,
-        wasSheriff,
-        sheriffWon: wasSheriff && isWinner,
-        currentWinStreak: stats.winStreak,
-        isFirstWinOfDay,
-      });
-
-      // Update XP and level
-      stats.totalXP = (stats.totalXP || 0) + xpGained;
-      const levelInfo = calculateLevelInfo(stats.totalXP);
-      stats.level = levelInfo.level;
-      stats.currentXP = levelInfo.currentXP;
-
-      // Track level ups
-      if (levelInfo.level > oldLevel) {
-        levelUpPlayers.push({
-          userId,
-          oldLevel,
-          newLevel: levelInfo.level,
-          xpGained,
-        });
-        logger.info(`Player ${userId} leveled up: ${oldLevel} -> ${levelInfo.level}`);
-      }
-
-      // Update total stats
-      stats.totalGames++;
-      if (isWinner) {
-        stats.wins++;
-      } else {
-        stats.losses++;
-      }
-      stats.winRate = stats.totalGames > 0
-        ? Math.round((stats.wins / stats.totalGames) * 100)
-        : 0;
-
-      // Update survival rate (weighted average)
-      const oldSurvivalWeight = (stats.totalGames - 1) * (stats.survivalRate || 0);
-      const newSurvival = isAlive ? 100 : 0;
-      stats.survivalRate = stats.totalGames > 0
-        ? Math.round((oldSurvivalWeight + newSurvival) / stats.totalGames)
-        : 0;
-
-      // Update faction stats
-      if (faction === 'werewolf') {
-        stats.werewolfGames++;
-        if (isWinner) stats.werewolfWins++;
-      } else if (faction === 'villager' || faction === 'neutral') {
-        stats.villagerGames++;
-        if (isWinner) stats.villagerWins++;
-      }
-
-      // Update lover stats
-      if (isLover) {
-        stats.loversGames++;
-        if (isWinner && winner === 'lovers') {
-          stats.loversWins++;
-        }
-      }
-
-      // Update role stats
-      if (role) {
-        if (!stats.roleStats[role]) {
-          stats.roleStats[role] = { played: 0, wins: 0 };
-        }
-        stats.roleStats[role].played++;
-        if (isWinner) {
-          stats.roleStats[role].wins++;
-        }
-      }
-
-      // Update sheriff stats
-      if (wasSheriff) {
-        stats.gamesAsSheriff++;
-        if (isWinner) {
-          stats.sheriffWins++;
-        }
-      }
-
-      // Update timestamps
-      if (stats.firstGameAt === 0) {
-        stats.firstGameAt = now;
-      }
-      stats.lastGameAt = now;
-
-      // Add to write batch
-      writes.push({
-        collection: STATS_COLLECTION,
-        key: STATS_KEY,
-        userId: userId,
-        value: stats,
-        permissionRead: 2, // Public read
-        permissionWrite: 0, // Server-only write
-      });
-    }
-
-    // Write all updates
-    nk.storageWrite(writes);
-    logger.info(`Recorded stats for ${writes.length} players, ${levelUpPlayers.length} leveled up`);
-
-    return JSON.stringify({
-      success: true,
-      playersUpdated: writes.length,
-      levelUps: levelUpPlayers,
-    });
-  } catch (e) {
-    logger.error(`Failed to record game result: ${e}`);
-    return JSON.stringify({
-      success: false,
-      error: `Failed to record game result: ${e}`,
-    });
-  }
-}
-
 // ============================================================================
 // Friend Invite System RPCs
 // ============================================================================
