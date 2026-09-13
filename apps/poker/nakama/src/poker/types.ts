@@ -161,6 +161,33 @@ export interface GameState {
     wonHand: boolean;
     handNumber: number;
   }[];
+
+  /**
+   * Hand result deferred until post-hand escrow checkpoint succeeds.
+   * Bookkeeping and SHOWDOWN/HAND_RESULT broadcasts wait on this.
+   */
+  pendingHandPublish?: {
+    kind: 'showdown' | 'fold_win';
+    winners: {
+      odid: string;
+      amount: number;
+      hand?: Card[];
+      handRank?: HandRank;
+      handDescription?: string;
+    }[];
+    showdownPlayers?: {
+      odid: string;
+      cards: Card[];
+      handRank: HandRank;
+      handDescription: string;
+      bestHand: Card[];
+    }[];
+    contributions: {
+      odid: string;
+      contributed: number;
+      status: PlayerStatus;
+    }[];
+  };
 }
 
 // Messages from client to server

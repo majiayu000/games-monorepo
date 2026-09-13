@@ -51,7 +51,8 @@ function createGameState(overrides: Partial<GameState> = {}): GameState {
     bigBlind: 20,
     startingChips: 1000,
     phase: GamePhase.PreFlop,
-    players: new Map(),
+    players: {},
+    spectators: {},
     deck: [],
     communityCards: [],
     pots: [{ amount: 30, eligiblePlayers: [] }],
@@ -91,9 +92,10 @@ function setupTwoPlayerGame(): { state: GameState; player1: Player; player2: Pla
     totalBetThisHand: 20
   });
 
-  const players = new Map<string, Player>();
-  players.set('p1', player1);
-  players.set('p2', player2);
+  const players: { [odid: string]: Player } = {
+    p1: player1,
+    p2: player2,
+  };
 
   const state = createGameState({
     players,
@@ -135,10 +137,11 @@ function setupThreePlayerGame(): { state: GameState; player1: Player; player2: P
     totalBetThisHand: 20
   });
 
-  const players = new Map<string, Player>();
-  players.set('p1', player1);
-  players.set('p2', player2);
-  players.set('p3', player3);
+  const players: { [odid: string]: Player } = {
+    p1: player1,
+    p2: player2,
+    p3: player3,
+  };
 
   const state = createGameState({
     players,
@@ -346,6 +349,36 @@ describe('Betting Logic', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Minimum bet');
+    });
+
+    it('should reject fractional bet amounts before mutating stacks', () => {
+      const { state, player1 } = setupTwoPlayerGame();
+      state.currentBet = 0;
+      player1.currentBet = 0;
+      const chipsBefore = player1.chips;
+
+      const result = executePlayerAction(state, 'p1', PlayerAction.Bet, 20.5);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('positive integer');
+      expect(player1.chips).toBe(chipsBefore);
+      expect(state.pots[0].amount).toBe(30);
+    });
+
+    it('should reject fractional raise amounts before mutating stacks', () => {
+      const { state, player1, player2 } = setupTwoPlayerGame();
+      state.currentBet = 20;
+      player1.currentBet = 0;
+      player2.currentBet = 20;
+      state.pots[0].amount = 30;
+      const chipsBefore = player1.chips;
+
+      const result = executePlayerAction(state, 'p1', PlayerAction.Raise, 40.75);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('positive integer');
+      expect(player1.chips).toBe(chipsBefore);
+      expect(state.pots[0].amount).toBe(30);
     });
 
     it('should allow bet equal to chips even if below minimum', () => {

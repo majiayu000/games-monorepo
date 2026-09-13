@@ -28,6 +28,7 @@ import {
   debitBuyInWithEscrow,
   enqueuePendingHandStatistics,
   flushPendingHandStatistics,
+  flushPendingLeaderboardUpdates,
   getWalletBalance,
   normalizeBlind,
   recordHandStatistics,
@@ -947,6 +948,7 @@ function cashOutAndRemovePlayer(
  * After a hand completes, settle players marked pendingLeave and optionally sync escrow.
  * When syncing, pending cash-outs and remaining escrow share one atomic write so a crash
  * cannot credit a departing winner while losers keep stale pre-hand escrow.
+ * Returns false when the post-hand escrow checkpoint fails (callers must defer publish).
  */
 function settlePendingLeaves(
   state: GameState,
@@ -954,7 +956,7 @@ function settlePendingLeaves(
   nk: nkruntime.Nakama,
   logger: nkruntime.Logger,
   syncEscrowForRemaining: boolean
-): void {
+): boolean {
   const toSettle = Object.entries(state.players).filter(([, player]) => !!player.pendingLeave);
   const remaining = Object.entries(state.players).filter(([, player]) => !player.pendingLeave);
 
@@ -1003,10 +1005,12 @@ function settlePendingLeaves(
         'Atomic pending-leave + escrow checkpoint failed; pausing new hands until retry succeeds',
         { matchId: state.matchId, error: e }
       );
+      updateMatchLabel(state, dispatcher);
+      return false;
     }
 
     updateMatchLabel(state, dispatcher);
-    return;
+    return true;
   }
 
   // Waiting-phase retry: cash out pending leaves only (no remaining-player checkpoint).
@@ -1030,6 +1034,7 @@ function settlePendingLeaves(
   }
 
   updateMatchLabel(state, dispatcher);
+  return true;
 }
 
 /**
@@ -1043,13 +1048,18 @@ function retryEscrowCheckpointIfNeeded(
   logger: nkruntime.Logger
 ): boolean {
   if (!state.escrowCheckpointFailed) {
+    // Checkpoint already healthy — still flush any deferred hand publish.
+    publishPendingHandResultIfAny(state, dispatcher, nk, logger);
     return true;
   }
 
   const hadPending = Object.values(state.players).some((p) => p.pendingLeave);
   if (hadPending) {
-    settlePendingLeaves(state, dispatcher, nk, logger, true);
-    return !state.escrowCheckpointFailed;
+    const ok = settlePendingLeaves(state, dispatcher, nk, logger, true);
+    if (ok) {
+      publishPendingHandResultIfAny(state, dispatcher, nk, logger);
+    }
+    return ok;
   }
 
   const remaining = Object.entries(state.players);
@@ -1062,6 +1072,7 @@ function retryEscrowCheckpointIfNeeded(
     );
     state.escrowCheckpointFailed = false;
     logger.info('Post-hand escrow checkpoint retry succeeded', { matchId: state.matchId });
+    publishPendingHandResultIfAny(state, dispatcher, nk, logger);
     return true;
   } catch (e) {
     logger.warn('Post-hand escrow checkpoint retry still failing; match remains paused', {
@@ -1070,6 +1081,42 @@ function retryEscrowCheckpointIfNeeded(
     });
     return false;
   }
+}
+
+/**
+ * After a durable escrow checkpoint succeeds, publish deferred hand results
+ * and record career bookkeeping that was held back on checkpoint failure.
+ */
+function publishPendingHandResultIfAny(
+  state: GameState,
+  dispatcher: nkruntime.MatchDispatcher,
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger
+): void {
+  const pending = state.pendingHandPublish;
+  if (!pending) {
+    return;
+  }
+
+  recordHandBookkeeping(state, nk, logger, pending.winners, pending.contributions);
+
+  if (pending.kind === 'showdown' && pending.showdownPlayers) {
+    broadcastMessage(dispatcher, OpCode.SHOWDOWN, {
+      players: pending.showdownPlayers,
+    });
+  }
+
+  broadcastMessage(dispatcher, OpCode.HAND_RESULT, {
+    winners: pending.winners,
+    showdown: pending.showdownPlayers || [],
+  });
+  broadcastMessage(dispatcher, OpCode.GAME_STATE, getPublicGameState(state));
+
+  state.pendingHandPublish = undefined;
+  logger.info('Published deferred hand result after escrow checkpoint', {
+    matchId: state.matchId,
+    kind: pending.kind,
+  });
 }
 
 interface HandContributionSnapshot {
@@ -1310,6 +1357,7 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       for (const userId of Object.keys(state.players)) {
         try {
           flushPendingHandStatistics(nk, userId, logger);
+          flushPendingLeaderboardUpdates(nk, userId, logger);
         } catch (e) {
           logger.warn('Failed flushing pending hand statistics', { userId, error: e });
         }
@@ -1458,7 +1506,17 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       // Persist resolved stacks BEFORE exposing the hand result so a crash
       // cannot leave clients with an announced outcome while escrow still has
       // the pre-hand distribution.
-      settlePendingLeaves(state, dispatcher, nk, logger, true);
+      if (!settlePendingLeaves(state, dispatcher, nk, logger, true)) {
+        // Defer bookkeeping + broadcasts until checkpoint retry succeeds.
+        state.pendingHandPublish = {
+          kind: 'showdown',
+          winners: showdownResult.winners,
+          showdownPlayers: showdownResult.showdownPlayers,
+          contributions: showdownContributions,
+        };
+        break;
+      }
+
       recordHandBookkeeping(
         state,
         nk,
@@ -1467,7 +1525,7 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
         showdownContributions
       );
 
-      // Broadcast showdown results only after the durable checkpoint attempt
+      // Broadcast showdown results only after the durable checkpoint succeeds
       broadcastMessage(dispatcher, OpCode.SHOWDOWN, {
         players: showdownResult.showdownPlayers
       });
@@ -1692,14 +1750,25 @@ function handlePostAction(
         const foldWinContributions = snapshotHandContributions(state);
         // Persist stacks before announcing the fold-win result so crash recovery
         // cannot erase an already-exposed hand outcome.
-        settlePendingLeaves(state, dispatcher, nk, logger, true);
+        if (!settlePendingLeaves(state, dispatcher, nk, logger, true)) {
+          state.pendingHandPublish = {
+            kind: 'fold_win',
+            winners: [{
+              odid: result.winnerId,
+              amount: result.amount,
+            }],
+            showdownPlayers: [],
+            contributions: foldWinContributions,
+          };
+          return;
+        }
         recordHandBookkeeping(state, nk, logger, [{
           odid: result.winnerId,
           amount: result.amount,
         }], foldWinContributions);
       }
 
-      // Broadcast hand result after durable checkpoint attempt
+      // Broadcast hand result after durable checkpoint succeeds
       broadcastMessage(dispatcher, OpCode.HAND_RESULT, {
         winners: [{
           odid: result.winnerId,

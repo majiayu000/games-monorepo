@@ -171,6 +171,10 @@ function executeBet(state: GameState, player: Player, amount?: number): ActionRe
     return { success: false, error: 'Bet amount required' };
   }
 
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || !Number.isInteger(amount) || amount <= 0) {
+    return { success: false, error: 'Bet amount must be a positive integer' };
+  }
+
   const { min, max } = getBetLimits(state, player.odid);
 
   // Validate bet amount
@@ -229,6 +233,10 @@ function executeRaise(state: GameState, player: Player, amount?: number): Action
 
   if (amount === undefined) {
     return { success: false, error: 'Raise amount required' };
+  }
+
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || !Number.isInteger(amount) || amount <= 0) {
+    return { success: false, error: 'Raise amount must be a positive integer' };
   }
 
   const toCall = state.currentBet - player.currentBet;

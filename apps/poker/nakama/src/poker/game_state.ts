@@ -384,13 +384,21 @@ export function hasPlayerTimedOut(state: GameState, currentTick: number): boolea
 }
 
 /**
- * Calculate side pots when players are all-in with different amounts
+ * Calculate side pots when players are all-in with different amounts.
+ * Pot amounts include every contribution (including folded players);
+ * eligibility excludes folded/sitting-out players.
  */
 export function calculateSidePots(state: GameState): void {
   const activePlayers = getActivePlayers(state);
   if (activePlayers.length === 0) return;
 
-  // Get all unique bet amounts from active players
+  // Include folded (and any other) contributors so their bets are not burned
+  const contributors = Object.values(state.players).filter(
+    (p) => (p.totalBetThisHand || 0) > 0
+  );
+  if (contributors.length === 0) return;
+
+  // Get all unique bet amounts from active all-in players
   const allInAmounts = activePlayers
     .filter(p => p.status === PlayerStatus.AllIn)
     .map(p => p.totalBetThisHand)
@@ -409,37 +417,45 @@ export function calculateSidePots(state: GameState): void {
       .filter(p => p.totalBetThisHand >= level)
       .map(p => p.odid);
 
-    // Calculate pot amount at this level
+    // Pot amount includes folded contributions at this level
     let potAmount = 0;
-    for (const player of activePlayers) {
-      const playerContribution = Math.min(player.totalBetThisHand - previousLevel, contribution);
+    for (const player of contributors) {
+      const playerContribution = Math.min(
+        Math.max(0, player.totalBetThisHand - previousLevel),
+        contribution
+      );
       if (playerContribution > 0) {
         potAmount += playerContribution;
       }
     }
 
-    if (potAmount > 0) {
+    if (potAmount > 0 && eligiblePlayers.length > 0) {
       pots.push({ amount: potAmount, eligiblePlayers });
+    } else if (potAmount > 0 && pots.length > 0) {
+      // No eligible players at this band (e.g. only folders) — attach to prior pot
+      pots[pots.length - 1].amount += potAmount;
     }
 
     previousLevel = level;
   }
 
-  // Add final pot for remaining amounts
+  // Add final pot for remaining amounts above the highest all-in
   const maxAllIn = Math.max(...allInAmounts);
   const remainingPlayers = activePlayers
     .filter(p => p.totalBetThisHand > maxAllIn)
     .map(p => p.odid);
 
-  if (remainingPlayers.length > 0) {
-    let remainingAmount = 0;
-    for (const player of activePlayers) {
-      if (player.totalBetThisHand > maxAllIn) {
-        remainingAmount += player.totalBetThisHand - maxAllIn;
-      }
+  let remainingAmount = 0;
+  for (const player of contributors) {
+    if (player.totalBetThisHand > maxAllIn) {
+      remainingAmount += player.totalBetThisHand - maxAllIn;
     }
-    if (remainingAmount > 0) {
+  }
+  if (remainingAmount > 0) {
+    if (remainingPlayers.length > 0) {
       pots.push({ amount: remainingAmount, eligiblePlayers: remainingPlayers });
+    } else if (pots.length > 0) {
+      pots[pots.length - 1].amount += remainingAmount;
     }
   }
 

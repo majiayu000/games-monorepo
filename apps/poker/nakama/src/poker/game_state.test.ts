@@ -73,7 +73,8 @@ function createGameState(overrides: Partial<GameState> = {}): GameState {
     bigBlind: 20,
     startingChips: 1000,
     phase: GamePhase.PreFlop,
-    players: new Map(),
+    players: {},
+    spectators: {},
     deck: createShuffledDeck(),
     communityCards: [],
     pots: [{ amount: 0, eligiblePlayers: [] }],
@@ -111,10 +112,11 @@ function setupThreePlayerGame(): { state: GameState; players: Player[] } {
     chips: 1000
   });
 
-  const playersMap = new Map<string, Player>();
-  playersMap.set('p1', player1);
-  playersMap.set('p2', player2);
-  playersMap.set('p3', player3);
+  const playersMap: { [odid: string]: Player } = {
+    p1: player1,
+    p2: player2,
+    p3: player3,
+  };
 
   const state = createGameState({ players: playersMap });
 
@@ -370,9 +372,10 @@ describe('assignBlinds', () => {
     const player1 = createPlayer({ odid: 'p1', seatIndex: 0, chips: 1000 });
     const player2 = createPlayer({ odid: 'p2', seatIndex: 1, chips: 1000 });
 
-    const playersMap = new Map<string, Player>();
-    playersMap.set('p1', player1);
-    playersMap.set('p2', player2);
+    const playersMap: { [odid: string]: Player } = {
+      p1: player1,
+      p2: player2,
+    };
 
     const state = createGameState({ players: playersMap, dealerSeatIndex: 0 });
 
@@ -463,8 +466,8 @@ describe('dealHoleCards', () => {
 
     const holeCards = dealHoleCards(state);
 
-    expect(holeCards.size).toBe(3);
-    holeCards.forEach((cards) => {
+    expect(Object.keys(holeCards)).toHaveLength(3);
+    Object.values(holeCards).forEach((cards) => {
       expect(cards).toHaveLength(2);
     });
   });
@@ -484,7 +487,7 @@ describe('dealHoleCards', () => {
 
     const holeCards = dealHoleCards(state);
 
-    expect(holeCards.has('p3')).toBe(false);
+    expect(holeCards['p3']).toBeUndefined();
   });
 
   it('should remove cards from deck', () => {
@@ -804,7 +807,7 @@ describe('startNewHand', () => {
     expect(state.pots[0].amount).toBe(30); // 10 + 20
 
     // Check hole cards dealt
-    expect(holeCards.size).toBe(3);
+    expect(Object.keys(holeCards)).toHaveLength(3);
 
     // Check phase is pre-flop
     expect(state.phase).toBe(GamePhase.PreFlop);
@@ -985,10 +988,11 @@ describe('calculateSidePots', () => {
       status: PlayerStatus.Active
     });
 
-    const playersMap = new Map<string, Player>();
-    playersMap.set('p1', player1);
-    playersMap.set('p2', player2);
-    playersMap.set('p3', player3);
+    const playersMap: { [odid: string]: Player } = {
+      p1: player1,
+      p2: player2,
+      p3: player3,
+    };
 
     const state = createGameState({ players: playersMap });
 
@@ -1000,6 +1004,51 @@ describe('calculateSidePots', () => {
     expect(state.pots[0].eligiblePlayers).toHaveLength(3);
     expect(state.pots[1].amount).toBe(60);
     expect(state.pots[1].eligiblePlayers).toHaveLength(2);
+  });
+
+  it('includes folded contributions in pot amounts while excluding them from eligibility', () => {
+    const player1 = createPlayer({
+      odid: 'p1',
+      seatIndex: 0,
+      chips: 0,
+      totalBetThisHand: 50,
+      status: PlayerStatus.AllIn
+    });
+    const player2 = createPlayer({
+      odid: 'p2',
+      seatIndex: 1,
+      chips: 50,
+      totalBetThisHand: 100,
+      status: PlayerStatus.Active
+    });
+    const player3 = createPlayer({
+      odid: 'p3',
+      seatIndex: 2,
+      chips: 0,
+      totalBetThisHand: 100,
+      status: PlayerStatus.Folded
+    });
+
+    const state = createGameState({
+      players: {
+        p1: player1,
+        p2: player2,
+        p3: player3,
+      } as unknown as GameState['players'],
+    });
+
+    calculateSidePots(state);
+
+    // Main pot: 50 from each of 3 players = 150; eligible = p1, p2 (not folded p3)
+    // Side pot: 50 from p2 + 50 from folded p3 = 100; eligible = p2 only
+    expect(state.pots[0].amount).toBe(150);
+    expect(state.pots[0].eligiblePlayers).toEqual(expect.arrayContaining(['p1', 'p2']));
+    expect(state.pots[0].eligiblePlayers).not.toContain('p3');
+    expect(state.pots[1].amount).toBe(100);
+    expect(state.pots[1].eligiblePlayers).toEqual(['p2']);
+
+    const awarded = state.pots.reduce((sum, pot) => sum + pot.amount, 0);
+    expect(awarded).toBe(250); // full 50+100+100 conserved
   });
 });
 
@@ -1296,9 +1345,10 @@ describe('Complex Game Scenarios', () => {
     const player1 = createPlayer({ odid: 'p1', seatIndex: 0, chips: 1000 });
     const player2 = createPlayer({ odid: 'p2', seatIndex: 1, chips: 1000 });
 
-    const playersMap = new Map<string, Player>();
-    playersMap.set('p1', player1);
-    playersMap.set('p2', player2);
+    const playersMap: { [odid: string]: Player } = {
+      p1: player1,
+      p2: player2,
+    };
 
     const state = createGameState({ players: playersMap });
 

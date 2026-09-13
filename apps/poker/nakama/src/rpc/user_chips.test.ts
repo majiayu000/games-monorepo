@@ -12,8 +12,10 @@ import {
   debitBuyIn,
   debitBuyInWithEscrow,
   enqueuePendingHandStatistics,
+  enqueuePendingLeaderboardUpdate,
   ensurePokerLeaderboard,
   flushPendingHandStatistics,
+  flushPendingLeaderboardUpdates,
   getChipsRpc,
   getWalletBalance,
   isPositiveBlind,
@@ -22,6 +24,7 @@ import {
   recordHandStatistics,
   settleCashOutsAndEscrowCheckpoint,
   updateChipsRpc,
+  updateLeaderboardScore,
   writeMatchEscrow,
   writeMatchEscrowBatch,
   MIN_BUY_IN,
@@ -53,7 +56,12 @@ function createMockNk(
     matchesAlive?: Record<string, boolean>;
     matchGetThrows?: Record<string, boolean>;
   } = {}
-): nkruntime.Nakama & { __leaderboardCreates: string[]; __leaderboardSortOrders: string[] } {
+): nkruntime.Nakama & {
+  __leaderboardCreates: string[];
+  __leaderboardSortOrders: string[];
+  __leaderboardWrites: { id: string; userId: string; score: number }[];
+  __failLeaderboardWrites?: boolean;
+} {
   const store = new Map<string, StoredObject>();
   let writeCount = 0;
   const failWritesUntil = options.failWritesUntil ?? 0;
@@ -61,6 +69,8 @@ function createMockNk(
   const matchGetThrows = options.matchGetThrows ?? {};
   const leaderboardCreates: string[] = [];
   const leaderboardSortOrders: string[] = [];
+  const leaderboardWrites: { id: string; userId: string; score: number }[] = [];
+  let failLeaderboardWrites = false;
 
   for (const [userId, balance] of Object.entries(initialByUser)) {
     store.set(`${userId}:user_data:chips`, {
@@ -83,6 +93,13 @@ function createMockNk(
   return {
     __leaderboardCreates: leaderboardCreates,
     __leaderboardSortOrders: leaderboardSortOrders,
+    __leaderboardWrites: leaderboardWrites,
+    get __failLeaderboardWrites() {
+      return failLeaderboardWrites;
+    },
+    set __failLeaderboardWrites(value: boolean) {
+      failLeaderboardWrites = value;
+    },
     storageRead: (queries: { collection: string; key: string; userId: string }[]) => {
       return queries
         .map((q) => store.get(`${q.userId}:${q.collection}:${q.key}`))
@@ -186,8 +203,18 @@ function createMockNk(
       leaderboardCreates.push(id);
       leaderboardSortOrders.push(sortOrder);
     },
-    leaderboardRecordWrite: () => undefined,
-  } as unknown as nkruntime.Nakama & { __leaderboardCreates: string[]; __leaderboardSortOrders: string[] };
+    leaderboardRecordWrite: (id: string, userId: string, _username: string | undefined, score: number) => {
+      if (failLeaderboardWrites) {
+        throw new Error('transient leaderboard write failure');
+      }
+      leaderboardWrites.push({ id, userId, score });
+    },
+  } as unknown as nkruntime.Nakama & {
+    __leaderboardCreates: string[];
+    __leaderboardSortOrders: string[];
+    __leaderboardWrites: { id: string; userId: string; score: number }[];
+    __failLeaderboardWrites?: boolean;
+  };
 }
 
 describe('clampStartingChips', () => {
@@ -679,6 +706,32 @@ describe('recordHandStatistics', () => {
     );
     expect(payload.handsPlayed).toBe(1);
     expect(payload.totalWon).toBe(150);
+  });
+
+  it('queues a pending leaderboard update when the leaderboard write fails after stats commit', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+    nk.__failLeaderboardWrites = true;
+
+    recordHandStatistics(nk, 'user1', 200, true, logger);
+
+    const payload = JSON.parse(
+      getChipsRpc({ userId: 'user1' } as nkruntime.Context, logger, nk, '')
+    );
+    expect(payload.totalWon).toBe(200);
+    expect(nk.__leaderboardWrites).toHaveLength(0);
+
+    // Pending record exists; get_chips flush still fails while flag is set
+    const listed = nk.storageList('user1', 'leaderboard_pending');
+    expect(listed.objects).toHaveLength(1);
+    expect((listed.objects[0].value as { totalWon: number }).totalWon).toBe(200);
+
+    nk.__failLeaderboardWrites = false;
+    expect(flushPendingLeaderboardUpdates(nk, 'user1', logger)).toBe(true);
+    expect(nk.__leaderboardWrites).toEqual([
+      { id: 'poker_total_won', userId: 'user1', score: 200 },
+    ]);
+    expect(nk.storageList('user1', 'leaderboard_pending').objects).toHaveLength(0);
   });
 });
 

@@ -8,6 +8,8 @@ const CHIPS_COLLECTION = 'user_data';
 const CHIPS_KEY = 'chips';
 const ESCROW_COLLECTION = 'match_escrow';
 const HAND_STATS_PENDING_COLLECTION = 'hand_stats_pending';
+const LEADERBOARD_PENDING_COLLECTION = 'leaderboard_pending';
+const LEADERBOARD_PENDING_KEY = 'poker_total_won';
 
 // Default starting chips for new users
 export const DEFAULT_STARTING_CHIPS = 10000;
@@ -84,6 +86,13 @@ export interface PendingHandStatRecord {
   wonHand: boolean;
   createdAt: number;
   /** pending = queued; applied = stats credited (safe to delete without re-applying) */
+  status?: 'pending' | 'applied';
+}
+
+export interface PendingLeaderboardRecord {
+  userId: string;
+  totalWon: number;
+  createdAt: number;
   status?: 'pending' | 'applied';
 }
 
@@ -1177,7 +1186,15 @@ function applyPendingHandStatistic(
         );
       }
 
-      updateLeaderboardScore(nk, userId, next.totalWon, logger);
+      if (!updateLeaderboardScore(nk, userId, next.totalWon, logger)) {
+        try {
+          enqueuePendingLeaderboardUpdate(nk, userId, next.totalWon, logger);
+        } catch (enqueueError) {
+          logger.warn(
+            `Stats applied but failed to queue leaderboard retry for ${userId}: ${enqueueError}`
+          );
+        }
+      }
       return true;
     } catch (e) {
       lastError = e;
@@ -1257,6 +1274,7 @@ export const getChipsRpc: nkruntime.RpcFunction = (
 
   reconcileOrphanedEscrows(nk, userId, logger);
   flushPendingHandStatistics(nk, userId, logger);
+  flushPendingLeaderboardUpdates(nk, userId, logger);
   const chipsData = getUserChips(nk, userId, logger).data;
 
   const response: GetChipsResponse = {
@@ -1422,7 +1440,123 @@ export function recordHandStatistics(
     totalWon = chipsData.totalWon;
   });
 
-  updateLeaderboardScore(nk, userId, totalWon, logger);
+  if (!updateLeaderboardScore(nk, userId, totalWon, logger)) {
+    enqueuePendingLeaderboardUpdate(nk, userId, totalWon, logger);
+  }
+}
+
+/**
+ * Persist a failed leaderboard write so it can be retried later.
+ * Idempotent: later totalWon values overwrite the pending record.
+ */
+export function enqueuePendingLeaderboardUpdate(
+  nk: nkruntime.Nakama,
+  userId: string,
+  totalWon: number,
+  logger: nkruntime.Logger
+): void {
+  if (!userId) {
+    return;
+  }
+
+  const record: PendingLeaderboardRecord = {
+    userId,
+    totalWon,
+    createdAt: Date.now(),
+    status: 'pending',
+  };
+
+  try {
+    nk.storageWrite([
+      {
+        collection: LEADERBOARD_PENDING_COLLECTION,
+        key: LEADERBOARD_PENDING_KEY,
+        userId,
+        value: record,
+        permissionRead: 1,
+        permissionWrite: 0,
+      },
+    ]);
+    logger.warn(
+      `Queued pending leaderboard update for ${userId} totalWon=${totalWon}`
+    );
+  } catch (e) {
+    logger.error(
+      `Failed to queue pending leaderboard update for ${userId}: ${e}`
+    );
+    throw e;
+  }
+}
+
+/**
+ * Retry any pending leaderboard updates for a user. Returns true when flushed or empty.
+ */
+export function flushPendingLeaderboardUpdates(
+  nk: nkruntime.Nakama,
+  userId: string,
+  logger: nkruntime.Logger
+): boolean {
+  if (!userId) {
+    return true;
+  }
+
+  let objects: nkruntime.StorageObject[];
+  try {
+    objects = nk.storageRead([
+      {
+        collection: LEADERBOARD_PENDING_COLLECTION,
+        key: LEADERBOARD_PENDING_KEY,
+        userId,
+      },
+    ]);
+  } catch (e) {
+    logger.warn(`Failed to read pending leaderboard update for ${userId}: ${e}`);
+    return false;
+  }
+
+  if (objects.length === 0) {
+    return true;
+  }
+
+  const obj = objects[0];
+  const pending = obj.value as PendingLeaderboardRecord | undefined;
+  if (!pending || pending.status === 'applied') {
+    try {
+      nk.storageDelete([
+        {
+          collection: LEADERBOARD_PENDING_COLLECTION,
+          key: LEADERBOARD_PENDING_KEY,
+          userId,
+        },
+      ]);
+    } catch (deleteError) {
+      logger.warn(
+        `Failed to delete applied pending leaderboard for ${userId}: ${deleteError}`
+      );
+    }
+    return true;
+  }
+
+  if (!updateLeaderboardScore(nk, userId, pending.totalWon, logger)) {
+    return false;
+  }
+
+  try {
+    nk.storageDelete([
+      {
+        collection: LEADERBOARD_PENDING_COLLECTION,
+        key: LEADERBOARD_PENDING_KEY,
+        userId,
+      },
+    ]);
+  } catch (deleteError) {
+    logger.warn(
+      `Leaderboard updated but failed to delete pending marker for ${userId}: ${deleteError}`
+    );
+  }
+
+  logger.info(`Flushed pending leaderboard update for ${userId}`);
+  return true;
 }
 
 /**
@@ -1494,14 +1628,15 @@ export function ensurePokerLeaderboard(
 }
 
 /**
- * Update leaderboard score (called after winning)
+ * Update leaderboard score (called after winning).
+ * Returns false when the write fails so callers can enqueue a retry.
  */
 export function updateLeaderboardScore(
   nk: nkruntime.Nakama,
   userId: string,
   totalWon: number,
   logger: nkruntime.Logger
-): void {
+): boolean {
   ensurePokerLeaderboard(nk, logger);
 
   try {
@@ -1514,7 +1649,9 @@ export function updateLeaderboardScore(
       undefined // metadata
     );
     logger.debug(`Updated leaderboard for user ${userId}: ${totalWon}`);
+    return true;
   } catch (e) {
     logger.error(`Failed to update leaderboard: ${e}`);
+    return false;
   }
 }
