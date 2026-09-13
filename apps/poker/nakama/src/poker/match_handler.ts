@@ -26,8 +26,9 @@ import {
   clampStartingChips,
   clearMatchEscrow,
   creditCashOut,
-  debitBuyIn,
+  debitBuyInWithEscrow,
   getWalletBalance,
+  recordHandStatistics,
   writeMatchEscrow,
 } from '../rpc/user_chips';
 
@@ -446,17 +447,10 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
       continue;
     }
 
-    // Create new player — debit wallet buy-in for table stack
+    // Create new player — atomically debit wallet + persist escrow for table stack
     let buyInChips = state.startingChips;
     try {
-      debitBuyIn(nk, presence.userId, state.startingChips, logger);
-      try {
-        writeMatchEscrow(nk, state.matchId, presence.userId, buyInChips, logger);
-      } catch (escrowErr) {
-        // Roll back debit if durable escrow cannot be recorded
-        creditCashOut(nk, presence.userId, buyInChips, logger);
-        throw escrowErr;
-      }
+      debitBuyInWithEscrow(nk, presence.userId, state.matchId, state.startingChips, logger);
     } catch (e) {
       logger.warn('Buy-in debit failed; seating as spectator', {
         userId: presence.userId,
@@ -471,11 +465,16 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
       broadcastMessage(dispatcher, OpCode.SPECTATOR_JOINED, {
         odid: presence.userId,
         displayName: spectator.displayName,
+        youAreSpectator: true,
+        reason: 'buyin_failed',
       });
       sendMessage(dispatcher, OpCode.ERROR, {
         message: e instanceof Error ? e.message : 'Insufficient chips for buy-in',
       }, presence);
       sendMessage(dispatcher, OpCode.GAME_STATE, getPublicGameState(state), presence);
+      sendMessage(dispatcher, OpCode.SPECTATOR_LIST, {
+        spectators: getSpectatorList(state),
+      }, presence);
       continue;
     }
 
@@ -670,8 +669,8 @@ function handleDisconnectedPlayers(
     if (hasDisconnectedPlayerTimedOut(player, tick)) {
       logger.info('Disconnected player grace period expired', { userId: odid });
 
-      // If player is in an active hand and is current player, auto-fold
-      if ((player.status === PlayerStatus.Active || player.status === PlayerStatus.AllIn) &&
+      // If player is in an active hand and is current player, auto-fold (not AllIn)
+      if (player.status === PlayerStatus.Active &&
           state.currentPlayerSeatIndex === player.seatIndex) {
         const result = autoFold(state, odid);
         if (result.success) {
@@ -690,7 +689,10 @@ function handleDisconnectedPlayers(
 
       player.disconnectedAt = undefined; // Clear so we don't process again
       player.pendingLeave = true;
-      player.status = PlayerStatus.SittingOut;
+      // Keep AllIn status so committed chips remain pot-eligible through showdown
+      if (player.status !== PlayerStatus.AllIn) {
+        player.status = PlayerStatus.SittingOut;
+      }
 
       // Waiting (or between hands): settle immediately. Mid-hand: cash out after hand ends.
       if (state.phase === GamePhase.Waiting) {
@@ -819,17 +821,58 @@ function settlePendingLeaves(
 
   if (syncEscrowForRemaining) {
     Object.entries(state.players).forEach(([userId, player]) => {
+      // After a hand, committed bets are already reflected in chips (or gone to winners).
+      // Do not add totalBetThisHand — that double-counts fold-win stacks.
+      player.totalBetThisHand = 0;
+      player.currentBet = 0;
       writeMatchEscrow(
         nk,
         state.matchId,
         userId,
-        player.chips + (player.totalBetThisHand || 0),
+        player.chips,
         logger
       );
     });
   }
 
   updateMatchLabel(state, dispatcher);
+}
+
+/**
+ * Persist career hand stats / leaderboard from authoritative hand results.
+ * Must run before totalBetThisHand is cleared by escrow sync.
+ */
+function recordHandBookkeeping(
+  state: GameState,
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger,
+  winners: { odid: string; amount: number }[]
+): void {
+  const winnerIds = new Set(winners.map((w) => w.odid));
+  const winnerAmounts = new Map(winners.map((w) => [w.odid, w.amount]));
+
+  Object.values(state.players).forEach((player) => {
+    const contributed = player.totalBetThisHand || 0;
+    const wonHand = winnerIds.has(player.odid);
+    const wasInHand =
+      contributed > 0 ||
+      wonHand ||
+      player.status === PlayerStatus.Folded ||
+      player.status === PlayerStatus.Active ||
+      player.status === PlayerStatus.AllIn;
+
+    if (!wasInHand) {
+      return;
+    }
+
+    const winAmount = winnerAmounts.get(player.odid) || 0;
+    const netChange = winAmount - contributed;
+    try {
+      recordHandStatistics(nk, player.odid, netChange, wonHand, logger);
+    } catch (e) {
+      logger.warn('Failed to record hand statistics', { userId: player.odid, error: e });
+    }
+  });
 }
 
 /**
@@ -859,15 +902,9 @@ function handleRequestSeat(
     return;
   }
 
-  // Debit wallet buy-in before seating
+  // Debit wallet buy-in and persist escrow atomically before seating
   try {
-    debitBuyIn(nk, odid, state.startingChips, logger);
-    try {
-      writeMatchEscrow(nk, state.matchId, odid, state.startingChips, logger);
-    } catch (escrowErr) {
-      creditCashOut(nk, odid, state.startingChips, logger);
-      throw escrowErr;
-    }
+    debitBuyInWithEscrow(nk, odid, state.matchId, state.startingChips, logger);
   } catch (e) {
     sendMessage(dispatcher, OpCode.ERROR, {
       message: e instanceof Error ? e.message : 'Insufficient chips for buy-in',
@@ -1096,6 +1133,7 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       state.phase = GamePhase.Waiting;
 
       // Cash out disconnect/leave players and refresh escrow for remaining seats
+      recordHandBookkeeping(state, nk, logger, showdownResult.winners);
       settlePendingLeaves(state, dispatcher, nk, logger, true);
 
       // Broadcast updated game state
@@ -1317,6 +1355,10 @@ function handlePostAction(
       });
 
       if (nk) {
+        recordHandBookkeeping(state, nk, logger, [{
+          odid: result.winnerId,
+          amount: result.amount,
+        }]);
         settlePendingLeaves(state, dispatcher, nk, logger, true);
       }
 

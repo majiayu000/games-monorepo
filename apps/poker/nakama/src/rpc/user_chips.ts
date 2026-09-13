@@ -231,7 +231,7 @@ export function clampStartingChips(value: number): number {
 
 /**
  * Persist durable match escrow so buy-ins can be reconciled after a crash.
- * Uses unconditional writes (last-write-wins) so escrow never blocks a completed debit.
+ * Uses unconditional writes (last-write-wins) for mid-match amount refreshes.
  */
 export function writeMatchEscrow(
   nk: nkruntime.Nakama,
@@ -284,6 +284,179 @@ export function writeMatchEscrow(
     logger.error(`Failed to write match escrow for ${userId} in ${matchId}: ${e}`);
     throw e;
   }
+}
+
+/**
+ * Atomically debit wallet and create/update match escrow in one storageWrite.
+ * Avoids the debit-without-escrow window if the process dies mid-join.
+ */
+export function debitBuyInWithEscrow(
+  nk: nkruntime.Nakama,
+  userId: string,
+  matchId: string,
+  amount: number,
+  logger: nkruntime.Logger
+): WalletMutationResult {
+  if (!matchId) {
+    throw new Error('Match id is required for escrowed buy-in');
+  }
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < MIN_BUY_IN) {
+    throw new Error(`Minimum buy-in is ${MIN_BUY_IN} chips`);
+  }
+
+  const buyIn = Math.floor(amount);
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= WALLET_WRITE_MAX_ATTEMPTS; attempt++) {
+    try {
+      const stored = getUserChips(nk, userId, logger);
+      if (stored.data.balance < buyIn) {
+        throw new Error('Insufficient chips for buy-in');
+      }
+
+      const previousBalance = stored.data.balance;
+      const next: UserChipsData = { ...stored.data, balance: previousBalance - buyIn };
+      next.lastUpdated = Date.now();
+
+      const now = Date.now();
+      const existingEscrow = nk.storageRead([
+        {
+          collection: ESCROW_COLLECTION,
+          key: escrowKey(matchId),
+          userId,
+        },
+      ]);
+      const previous =
+        existingEscrow.length > 0 && existingEscrow[0].value
+          ? (existingEscrow[0].value as MatchEscrowRecord)
+          : null;
+
+      const escrowRecord: MatchEscrowRecord = {
+        matchId,
+        userId,
+        amount: buyIn,
+        status: 'active',
+        createdAt: previous?.createdAt || now,
+        updatedAt: now,
+      };
+
+      // Single multi-object write: wallet debit + escrow succeed or fail together
+      nk.storageWrite([
+        {
+          collection: CHIPS_COLLECTION,
+          key: CHIPS_KEY,
+          userId,
+          value: next,
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: stored.version,
+        },
+        {
+          collection: ESCROW_COLLECTION,
+          key: escrowKey(matchId),
+          userId,
+          value: escrowRecord,
+          permissionRead: 1,
+          permissionWrite: 0,
+        },
+      ]);
+
+      logger.info(
+        `User ${userId} escrowed buy-in in ${matchId}: ${previousBalance} -> ${next.balance} (amount: ${buyIn})`
+      );
+
+      return {
+        balance: next.balance,
+        previousBalance,
+        change: next.balance - previousBalance,
+      };
+    } catch (e) {
+      lastError = e;
+      if (
+        e instanceof Error &&
+        (e.message === 'Insufficient chips for buy-in' ||
+          e.message.startsWith('Minimum buy-in'))
+      ) {
+        throw e;
+      }
+      if (!isVersionConflict(e) || attempt === WALLET_WRITE_MAX_ATTEMPTS) {
+        throw e;
+      }
+      logger.warn(
+        `Escrowed buy-in conflict for ${userId}, retrying (${attempt}/${WALLET_WRITE_MAX_ATTEMPTS})`
+      );
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function isMatchAlive(nk: nkruntime.Nakama, matchId: string): boolean {
+  try {
+    const match = nk.matchGet(matchId);
+    return !!match;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Credit back active escrow records whose matches are no longer running.
+ * Called from get_chips so crash-orphaned buy-ins are recovered on next wallet read.
+ */
+export function reconcileOrphanedEscrows(
+  nk: nkruntime.Nakama,
+  userId: string,
+  logger: nkruntime.Logger
+): number {
+  if (!userId) {
+    return 0;
+  }
+
+  let refunded = 0;
+  let cursor: string | undefined;
+
+  do {
+    let listed: nkruntime.StorageObjectList;
+    try {
+      listed = nk.storageList(userId, ESCROW_COLLECTION, 100, cursor);
+    } catch (e) {
+      logger.warn(`Failed to list escrow for ${userId}: ${e}`);
+      return refunded;
+    }
+
+    const objects = listed.objects || [];
+    for (const obj of objects) {
+      const record = obj.value as MatchEscrowRecord | undefined;
+      if (!record || record.status !== 'active' || !record.matchId) {
+        continue;
+      }
+      if (isMatchAlive(nk, record.matchId)) {
+        continue;
+      }
+
+      const amount = Math.max(0, Math.floor(record.amount || 0));
+      if (amount > 0) {
+        try {
+          creditCashOut(nk, userId, amount, logger);
+          refunded += amount;
+          logger.info(
+            `Reconciled orphaned escrow for ${userId} match ${record.matchId}: +${amount}`
+          );
+        } catch (e) {
+          logger.error(
+            `Failed to credit orphaned escrow for ${userId} match ${record.matchId}: ${e}`
+          );
+          continue;
+        }
+      }
+      clearMatchEscrow(nk, record.matchId, userId, logger);
+    }
+
+    cursor = listed.cursor || undefined;
+  } while (cursor);
+
+  return refunded;
 }
 
 /**
@@ -366,7 +539,8 @@ export function creditCashOut(
 }
 
 /**
- * Get user's chip balance and stats
+ * Get user's chip balance and stats.
+ * Also reconciles orphaned match escrow left behind by crash/shutdown.
  */
 export const getChipsRpc: nkruntime.RpcFunction = (
   ctx: nkruntime.Context,
@@ -379,6 +553,7 @@ export const getChipsRpc: nkruntime.RpcFunction = (
     throw new Error('User not authenticated');
   }
 
+  reconcileOrphanedEscrows(nk, userId, logger);
   const chipsData = getUserChips(nk, userId, logger).data;
 
   const response: GetChipsResponse = {
@@ -407,7 +582,8 @@ export const updateChipsRpc: nkruntime.RpcFunction = (
 
 /**
  * Claim daily reward
- * Players can claim once every 24 hours
+ * Players can claim once every 24 hours.
+ * Cooldown claim and wallet credit are written in one atomic storageWrite.
  */
 export const claimDailyRewardRpc: nkruntime.RpcFunction = (
   ctx: nkruntime.Context,
@@ -420,76 +596,128 @@ export const claimDailyRewardRpc: nkruntime.RpcFunction = (
     throw new Error('User not authenticated');
   }
 
-  // Daily reward storage
   const DAILY_REWARD_KEY = 'daily_reward';
   const DAILY_REWARD_AMOUNT = 500;
   const REWARD_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-  // Check last claim time
-  const rewardObjects = nk.storageRead([
-    {
-      collection: CHIPS_COLLECTION,
-      key: DAILY_REWARD_KEY,
-      userId: userId,
-    },
-  ]);
+  let lastError: unknown;
 
-  const now = Date.now();
-  let lastClaimTime = 0;
-  let rewardVersion: string | undefined;
+  for (let attempt = 1; attempt <= WALLET_WRITE_MAX_ATTEMPTS; attempt++) {
+    const now = Date.now();
 
-  if (rewardObjects.length > 0 && rewardObjects[0].value) {
-    lastClaimTime = (rewardObjects[0].value as { lastClaim: number }).lastClaim || 0;
-    rewardVersion = rewardObjects[0].version;
+    const rewardObjects = nk.storageRead([
+      {
+        collection: CHIPS_COLLECTION,
+        key: DAILY_REWARD_KEY,
+        userId: userId,
+      },
+    ]);
+
+    let lastClaimTime = 0;
+    let rewardVersion: string | undefined;
+    if (rewardObjects.length > 0 && rewardObjects[0].value) {
+      lastClaimTime = (rewardObjects[0].value as { lastClaim: number }).lastClaim || 0;
+      rewardVersion = rewardObjects[0].version;
+    }
+
+    const timeSinceLastClaim = now - lastClaimTime;
+    const nextRewardTime = lastClaimTime + REWARD_COOLDOWN_MS;
+
+    if (timeSinceLastClaim < REWARD_COOLDOWN_MS) {
+      const hoursRemaining = Math.ceil(
+        (REWARD_COOLDOWN_MS - timeSinceLastClaim) / (60 * 60 * 1000)
+      );
+      const chipsData = getUserChips(nk, userId, logger).data;
+      const response: DailyRewardResponse = {
+        rewarded: false,
+        amount: 0,
+        balance: chipsData.balance,
+        nextRewardTime,
+        message: `Come back in ${hoursRemaining} hour(s) for your daily reward!`,
+      };
+      return JSON.stringify(response);
+    }
+
+    try {
+      const stored = getUserChips(nk, userId, logger);
+      const previousBalance = stored.data.balance;
+      const next: UserChipsData = {
+        ...stored.data,
+        balance: previousBalance + DAILY_REWARD_AMOUNT,
+      };
+      next.lastUpdated = now;
+
+      // Atomic: wallet credit + cooldown claim succeed or fail together
+      nk.storageWrite([
+        {
+          collection: CHIPS_COLLECTION,
+          key: CHIPS_KEY,
+          userId,
+          value: next,
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: stored.version,
+        },
+        {
+          collection: CHIPS_COLLECTION,
+          key: DAILY_REWARD_KEY,
+          userId,
+          value: { lastClaim: now },
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: rewardVersion || '*',
+        },
+      ]);
+
+      logger.info(`User ${userId} claimed daily reward: ${DAILY_REWARD_AMOUNT} chips`);
+
+      const response: DailyRewardResponse = {
+        rewarded: true,
+        amount: DAILY_REWARD_AMOUNT,
+        balance: next.balance,
+        nextRewardTime: now + REWARD_COOLDOWN_MS,
+        message: `You received ${DAILY_REWARD_AMOUNT} chips!`,
+      };
+      return JSON.stringify(response);
+    } catch (e) {
+      lastError = e;
+      if (!isVersionConflict(e) || attempt === WALLET_WRITE_MAX_ATTEMPTS) {
+        throw e;
+      }
+      logger.warn(
+        `Daily reward conflict for ${userId}, retrying (${attempt}/${WALLET_WRITE_MAX_ATTEMPTS})`
+      );
+    }
   }
 
-  const timeSinceLastClaim = now - lastClaimTime;
-  const nextRewardTime = lastClaimTime + REWARD_COOLDOWN_MS;
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+};
 
-  if (timeSinceLastClaim < REWARD_COOLDOWN_MS) {
-    const hoursRemaining = Math.ceil((REWARD_COOLDOWN_MS - timeSinceLastClaim) / (60 * 60 * 1000));
-
-    const chipsData = getUserChips(nk, userId, logger).data;
-    const response: DailyRewardResponse = {
-      rewarded: false,
-      amount: 0,
-      balance: chipsData.balance,
-      nextRewardTime,
-      message: `Come back in ${hoursRemaining} hour(s) for your daily reward!`,
-    };
-    return JSON.stringify(response);
-  }
-
-  // Give the reward with version-guarded wallet write
-  const walletResult = mutateWallet(nk, userId, logger, (chipsData) => {
-    chipsData.balance += DAILY_REWARD_AMOUNT;
+/**
+ * Authoritative hand bookkeeping after a hand resolves (replaces client update_chips).
+ */
+export function recordHandStatistics(
+  nk: nkruntime.Nakama,
+  userId: string,
+  netChange: number,
+  wonHand: boolean,
+  logger: nkruntime.Logger
+): void {
+  mutateWallet(nk, userId, logger, (chipsData) => {
+    chipsData.handsPlayed += 1;
+    if (wonHand) {
+      chipsData.handsWon += 1;
+    }
+    if (netChange > 0) {
+      chipsData.totalWon += netChange;
+    } else if (netChange < 0) {
+      chipsData.totalLost += Math.abs(netChange);
+    }
   });
 
-  // Update last claim time (version-guarded when possible)
-  nk.storageWrite([
-    {
-      collection: CHIPS_COLLECTION,
-      key: DAILY_REWARD_KEY,
-      userId: userId,
-      value: { lastClaim: now },
-      permissionRead: 1,
-      permissionWrite: 0,
-      version: rewardVersion || '*',
-    },
-  ]);
-
-  logger.info(`User ${userId} claimed daily reward: ${DAILY_REWARD_AMOUNT} chips`);
-
-  const response: DailyRewardResponse = {
-    rewarded: true,
-    amount: DAILY_REWARD_AMOUNT,
-    balance: walletResult.balance,
-    nextRewardTime: now + REWARD_COOLDOWN_MS,
-    message: `You received ${DAILY_REWARD_AMOUNT} chips!`,
-  };
-
-  return JSON.stringify(response);
-};
+  const chipsData = getUserChips(nk, userId, logger).data;
+  updateLeaderboardScore(nk, userId, chipsData.totalWon, logger);
+}
 
 /**
  * Get leaderboard data

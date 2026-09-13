@@ -250,10 +250,19 @@ export function useNakama() {
       }
 
       case OpCode.SPECTATOR_JOINED: {
-        const spectatorData = data as ServerSpectatorJoinedData
+        const spectatorData = data as ServerSpectatorJoinedData & {
+          youAreSpectator?: boolean
+        }
+        const { userId } = useGameStore.getState()
         console.log('Spectator joined:', spectatorData.displayName)
         addSpectator({ id: spectatorData.odid, name: spectatorData.displayName })
-        addChatMessage('system', 'System', `${spectatorData.displayName} is now watching`)
+        // Explicit role update when buy-in fails or server seats us as spectator
+        if (spectatorData.odid === userId || spectatorData.youAreSpectator) {
+          setIsSpectator(true)
+          addChatMessage('system', 'System', 'You are spectating this table')
+        } else {
+          addChatMessage('system', 'System', `${spectatorData.displayName} is now watching`)
+        }
         break
       }
 
@@ -282,8 +291,12 @@ export function useNakama() {
 
       case OpCode.SPECTATOR_LIST: {
         const listData = data as ServerSpectatorListData
+        const { userId } = useGameStore.getState()
         console.log('Spectator list:', listData.spectators)
         setSpectators(listData.spectators.map(s => ({ id: s.odid, name: s.displayName })))
+        if (userId && listData.spectators.some((s) => s.odid === userId)) {
+          setIsSpectator(true)
+        }
         break
       }
 

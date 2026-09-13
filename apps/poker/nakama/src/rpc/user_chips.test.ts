@@ -5,10 +5,15 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   clampStartingChips,
+  claimDailyRewardRpc,
   clearMatchEscrow,
   creditCashOut,
   debitBuyIn,
+  debitBuyInWithEscrow,
+  getChipsRpc,
   getWalletBalance,
+  reconcileOrphanedEscrows,
+  recordHandStatistics,
   updateChipsRpc,
   writeMatchEscrow,
   MIN_BUY_IN,
@@ -35,11 +40,15 @@ function createLogger(): nkruntime.Logger {
 
 function createMockNk(
   initialByUser: Record<string, number> = {},
-  options: { failWritesUntil?: number } = {}
+  options: {
+    failWritesUntil?: number;
+    matchesAlive?: Record<string, boolean>;
+  } = {}
 ): nkruntime.Nakama {
   const store = new Map<string, StoredObject>();
   let writeCount = 0;
   const failWritesUntil = options.failWritesUntil ?? 0;
+  const matchesAlive = options.matchesAlive ?? {};
 
   for (const [userId, balance] of Object.entries(initialByUser)) {
     store.set(`${userId}:user_data:chips`, {
@@ -88,11 +97,10 @@ function createMockNk(
         throw new Error('version conflict');
       }
 
-      const acks: { collection: string; key: string; userId: string; version: string }[] = [];
+      // Validate all version constraints before applying any write (atomic batch)
       for (const obj of objects) {
         const storeKey = `${obj.userId}:${obj.collection}:${obj.key}`;
         const existing = store.get(storeKey);
-
         if (obj.version === '*') {
           if (existing) {
             throw new Error('version conflict: object already exists');
@@ -100,7 +108,12 @@ function createMockNk(
         } else if (obj.version !== undefined && existing && existing.version !== obj.version) {
           throw new Error('version conflict');
         }
+      }
 
+      const acks: { collection: string; key: string; userId: string; version: string }[] = [];
+      for (const obj of objects) {
+        const storeKey = `${obj.userId}:${obj.collection}:${obj.key}`;
+        const existing = store.get(storeKey);
         const nextVersion = existing
           ? String(Number(existing.version || '0') + 1)
           : '1';
@@ -126,6 +139,33 @@ function createMockNk(
         store.delete(`${d.userId}:${d.collection}:${d.key}`);
       }
     },
+    storageList: (userId: string, collection: string) => {
+      const objects: StoredObject[] = [];
+      for (const obj of store.values()) {
+        if (obj.userId === userId && obj.collection === collection) {
+          objects.push(obj);
+        }
+      }
+      return {
+        objects: objects.map((obj) => ({
+          collection: obj.collection,
+          key: obj.key,
+          userId: obj.userId,
+          value: { ...obj.value },
+          version: obj.version,
+          permissionRead: 1,
+          permissionWrite: 0,
+        })),
+        cursor: undefined,
+      };
+    },
+    matchGet: (matchId: string) => {
+      if (matchesAlive[matchId]) {
+        return { matchId } as nkruntime.Match;
+      }
+      return null;
+    },
+    leaderboardRecordWrite: () => undefined,
   } as unknown as nkruntime.Nakama;
 }
 
@@ -236,6 +276,73 @@ describe('match escrow', () => {
       { collection: 'match_escrow', key: 'escrow:match-1', userId: 'user1' },
     ]);
     expect(after).toHaveLength(0);
+  });
+
+  it('debits wallet and writes escrow in one atomic batch', () => {
+    const nk = createMockNk({ user1: 5000 });
+    debitBuyInWithEscrow(nk, 'user1', 'match-1', 1000, logger);
+
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(4000);
+    const objects = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: 'escrow:match-1', userId: 'user1' },
+    ]);
+    expect(objects).toHaveLength(1);
+    expect(objects[0].value.amount).toBe(1000);
+  });
+
+  it('refunds orphaned escrow when match is gone', () => {
+    const nk = createMockNk({ user1: 4000 }, { matchesAlive: {} });
+    writeMatchEscrow(nk, 'dead-match', 'user1', 1000, logger);
+
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger);
+    expect(refunded).toBe(1000);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
+
+    const after = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: 'escrow:dead-match', userId: 'user1' },
+    ]);
+    expect(after).toHaveLength(0);
+  });
+
+  it('leaves escrow untouched while match is still alive', () => {
+    const nk = createMockNk({ user1: 4000 }, { matchesAlive: { 'live-match': true } });
+    writeMatchEscrow(nk, 'live-match', 'user1', 1000, logger);
+
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger);
+    expect(refunded).toBe(0);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(4000);
+  });
+});
+
+describe('claimDailyRewardRpc atomicity', () => {
+  it('credits wallet and claims cooldown in one write', () => {
+    const nk = createMockNk({ user1: 1000 });
+    const logger = createLogger();
+    const ctx = { userId: 'user1' } as nkruntime.Context;
+
+    const first = JSON.parse(claimDailyRewardRpc(ctx, logger, nk, ''));
+    expect(first.rewarded).toBe(true);
+    expect(first.balance).toBe(1500);
+
+    const second = JSON.parse(claimDailyRewardRpc(ctx, logger, nk, ''));
+    expect(second.rewarded).toBe(false);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(1500);
+  });
+});
+
+describe('recordHandStatistics', () => {
+  it('updates handsPlayed/handsWon and career totals without minting balance', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+
+    recordHandStatistics(nk, 'user1', 200, true, logger);
+    const payload = JSON.parse(
+      getChipsRpc({ userId: 'user1' } as nkruntime.Context, logger, nk, '')
+    );
+    expect(payload.balance).toBe(5000);
+    expect(payload.handsPlayed).toBe(1);
+    expect(payload.handsWon).toBe(1);
+    expect(payload.totalWon).toBe(200);
   });
 });
 
