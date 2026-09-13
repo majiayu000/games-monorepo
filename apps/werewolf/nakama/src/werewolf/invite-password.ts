@@ -129,6 +129,43 @@ export function isAtPendingInviteLimit(
 }
 
 /**
+ * Remove a single invite from an in-memory list (send-failure rollback).
+ */
+export function withoutInviteId(invites: GameInvite[], inviteId: string): GameInvite[] {
+  return invites.filter((invite) => invite.inviteId !== inviteId);
+}
+
+/**
+ * Whether a storageDelete failure is safe to ignore (object already absent).
+ * Transient / unknown errors must be propagated so callers can retry.
+ */
+export function isBenignStorageDeleteError(error: unknown): boolean {
+  const message = String(error ?? '').toLowerCase();
+  if (!message) {
+    return false;
+  }
+  return (
+    message.includes('not found') ||
+    message.includes('not_found') ||
+    message.includes('does not exist') ||
+    message.includes('no storage object') ||
+    message.includes('storage object not found')
+  );
+}
+
+/**
+ * After send persistence fails, delete the password secret only when no
+ * invite row remains that could still be accepted via polling.
+ */
+export function shouldDeleteSecretAfterSendRollback(
+  secretWritten: boolean,
+  senderInviteRolledBack: boolean,
+  receiverInviteRolledBack: boolean
+): boolean {
+  return secretWritten && senderInviteRolledBack && receiverInviteRolledBack;
+}
+
+/**
  * Accept path: private invites must resolve a non-empty password before the
  * invite may be committed as ACCEPTED.
  *

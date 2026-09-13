@@ -11,6 +11,7 @@ import {
   inviteMayRetainPasswordSecret,
   invitesDroppedByHistoryCap,
   isAtPendingInviteLimit,
+  isBenignStorageDeleteError,
   isInviteVisibleInGetInvites,
   INVITE_HISTORY_CAP,
   INVITE_SECRET_PERMISSION_READ,
@@ -19,6 +20,8 @@ import {
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
   shouldDeleteSecretAfterHistoryCap,
+  shouldDeleteSecretAfterSendRollback,
+  withoutInviteId,
   MATCH_SIGNAL_GET_PASSWORD,
 } from '../werewolf/invite-password';
 import { GameInvite, InviteStatus, INVITE_CONFIG } from '../werewolf/types';
@@ -562,5 +565,100 @@ describe('invite password attachment from matchSignal', () => {
     expect(secretStore['inv-expired']).toBeUndefined();
     expect(invites[1].status).toBe(InviteStatus.DECLINED);
     expect(secretStore['inv-declined']).toEqual({ password: 'should-not-touch' });
+  });
+
+  it('send rollback deletes secret only after invite rows are removed', () => {
+    const secretStore: Record<string, { password: string }> = {
+      'inv-rollback': { password: 'keep-or-drop' },
+    };
+    const senderInvites: GameInvite[] = [
+      {
+        inviteId: 'inv-rollback',
+        matchId: 'm1',
+        roomName: 'Private',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: 'guest-1',
+        receiverName: 'Guest',
+        status: InviteStatus.PENDING,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: 1,
+        expiresAt: Date.now() + 60_000,
+        isPrivate: true,
+      },
+    ];
+    const receiverInvites = [...senderInvites];
+
+    // notificationsSend failed after both writes: roll back rows, then secret
+    const rolledSender = withoutInviteId(senderInvites, 'inv-rollback');
+    const rolledReceiver = withoutInviteId(receiverInvites, 'inv-rollback');
+    expect(rolledSender).toEqual([]);
+    expect(rolledReceiver).toEqual([]);
+    expect(shouldDeleteSecretAfterSendRollback(true, true, true)).toBe(true);
+    if (shouldDeleteSecretAfterSendRollback(true, true, true)) {
+      delete secretStore['inv-rollback'];
+    }
+    expect(secretStore['inv-rollback']).toBeUndefined();
+
+    // Incomplete row rollback must retain the secret so accept via polling works
+    secretStore['inv-orphan'] = { password: 'still-needed' };
+    expect(shouldDeleteSecretAfterSendRollback(true, true, false)).toBe(false);
+    expect(shouldDeleteSecretAfterSendRollback(true, false, true)).toBe(false);
+    if (shouldDeleteSecretAfterSendRollback(true, true, false)) {
+      delete secretStore['inv-orphan'];
+    }
+    expect(secretStore['inv-orphan']).toEqual({ password: 'still-needed' });
+  });
+
+  it('isBenignStorageDeleteError ignores missing objects but not transient failures', () => {
+    expect(isBenignStorageDeleteError('storage object not found')).toBe(true);
+    expect(isBenignStorageDeleteError(new Error('Not Found'))).toBe(true);
+    expect(isBenignStorageDeleteError('does not exist')).toBe(true);
+    expect(isBenignStorageDeleteError('temporary storage unavailable')).toBe(false);
+    expect(isBenignStorageDeleteError(new Error('connection reset'))).toBe(false);
+    expect(isBenignStorageDeleteError('')).toBe(false);
+  });
+
+  it('decline/cancel delete failures stay retryable until terminal status is written', () => {
+    const secretStore: Record<string, { password: string }> = {
+      'inv-decline': { password: 'room-pass' },
+    };
+    const invite: GameInvite = {
+      inviteId: 'inv-decline',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: Date.now() + 60_000,
+      isPrivate: true,
+    };
+
+    // Simulate transient delete failure before status update
+    const deleteOnce = (shouldFail: boolean) => {
+      if (shouldFail) {
+        const err = new Error('temporary storage unavailable');
+        if (!isBenignStorageDeleteError(err)) {
+          throw err;
+        }
+      }
+      delete secretStore[invite.inviteId];
+    };
+
+    expect(() => deleteOnce(true)).toThrow('temporary storage unavailable');
+    expect(invite.status).toBe(InviteStatus.PENDING);
+    expect(secretStore['inv-decline']).toEqual({ password: 'room-pass' });
+
+    // Retry succeeds, then terminal status is committed
+    deleteOnce(false);
+    invite.status = InviteStatus.DECLINED;
+    expect(secretStore['inv-decline']).toBeUndefined();
+    expect(invite.status).toBe(InviteStatus.DECLINED);
   });
 });
