@@ -23,20 +23,38 @@ export function inviteForOwnerStorage(invite: GameInvite): GameInvite {
 }
 
 /**
- * Accept path: private invites must resolve a non-empty server-only secret
- * before the invite may be committed as ACCEPTED.
+ * Accept path: private invites must resolve a non-empty password before the
+ * invite may be committed as ACCEPTED.
+ *
+ * Prefer the server-only secret store. Fall back to a legacy inline
+ * `invite.password` for pending records created before the secret migration
+ * (those lack `isPrivate` and a secret row).
  */
 export function resolveAcceptInvitePassword(
   isPrivate: boolean | undefined,
-  secretPassword: string | undefined
+  secretPassword: string | undefined,
+  legacyPassword?: string | undefined
 ): { ok: true; password?: string } | { ok: false; error: string } {
-  if (isPrivate) {
-    if (!secretPassword) {
+  const fromSecret =
+    typeof secretPassword === 'string' && secretPassword.length > 0
+      ? secretPassword
+      : undefined;
+  const fromLegacy =
+    typeof legacyPassword === 'string' && legacyPassword.length > 0
+      ? legacyPassword
+      : undefined;
+  const password = fromSecret ?? fromLegacy;
+
+  // Explicit private flag, or legacy private invite (password inline, no isPrivate).
+  const effectivelyPrivate = isPrivate === true || (!!fromLegacy && isPrivate !== false);
+
+  if (effectivelyPrivate) {
+    if (!password) {
       return { ok: false, error: 'Private room password unavailable' };
     }
-    return { ok: true, password: secretPassword };
+    return { ok: true, password };
   }
-  return { ok: true, password: secretPassword };
+  return { ok: true, password: fromSecret };
 }
 
 export interface GetPasswordSignalRequest {

@@ -169,15 +169,21 @@ describe('invite password attachment from matchSignal', () => {
     );
     expect(acceptResolved.ok).toBe(true);
     if (acceptResolved.ok) {
-      delete secretStore['inv-e2e'];
+      // Secret is retained after accept so join retries can re-fetch until expiry
       const acceptPayload = {
         success: true,
         matchId: state.matchId,
         password: acceptResolved.password,
       };
       expect(acceptPayload.password).toBe('invite-secret');
+      expect(secretStore['inv-e2e']).toEqual({ password: 'invite-secret' });
+
+      const retryResolved = resolveAcceptInvitePassword(
+        ownerInvite.isPrivate,
+        secretStore['inv-e2e']?.password
+      );
+      expect(retryResolved).toEqual({ ok: true, password: 'invite-secret' });
     }
-    expect(secretStore['inv-e2e']).toBeUndefined();
   });
 
   it('resolveAcceptInvitePassword requires secret for private invites', () => {
@@ -201,6 +207,60 @@ describe('invite password attachment from matchSignal', () => {
       ok: true,
       password: undefined,
     });
+  });
+
+  it('resolveAcceptInvitePassword migrates legacy inline password without isPrivate', () => {
+    // Pending invite from previous server: password inline, no isPrivate, no secret row
+    expect(resolveAcceptInvitePassword(undefined, undefined, 'legacy-pass')).toEqual({
+      ok: true,
+      password: 'legacy-pass',
+    });
+    // Explicit private prefers secret, falls back to legacy
+    expect(resolveAcceptInvitePassword(true, undefined, 'legacy-pass')).toEqual({
+      ok: true,
+      password: 'legacy-pass',
+    });
+    expect(resolveAcceptInvitePassword(true, 'secret-pass', 'legacy-pass')).toEqual({
+      ok: true,
+      password: 'secret-pass',
+    });
+  });
+
+  it('accepted secret is retained for join retry until expiry cleanup', () => {
+    const secretStore: Record<string, { password: string }> = {
+      'inv-accepted': { password: 'join-me' },
+    };
+    const invite: GameInvite = {
+      inviteId: 'inv-accepted',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.ACCEPTED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: Date.now() + 60_000,
+      isPrivate: true,
+    };
+
+    // Re-fetch after failed join
+    const retry = resolveAcceptInvitePassword(
+      invite.isPrivate,
+      secretStore[invite.inviteId]?.password
+    );
+    expect(retry).toEqual({ ok: true, password: 'join-me' });
+    expect(secretStore['inv-accepted']).toEqual({ password: 'join-me' });
+
+    // Expiry cleanup drops the retained accepted secret
+    invite.expiresAt = 1;
+    const now = Date.now();
+    if (invite.expiresAt < now) {
+      delete secretStore[invite.inviteId];
+    }
+    expect(secretStore['inv-accepted']).toBeUndefined();
   });
 
   it('expire path drops server-only secrets so they do not accumulate', () => {

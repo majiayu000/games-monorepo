@@ -816,11 +816,13 @@ function rpcGetInvites(
     let hasExpired = false;
 
     for (const invite of invites) {
-      if (invite.status === InviteStatus.PENDING && invite.expiresAt < now) {
-        invite.status = InviteStatus.EXPIRED;
-        hasExpired = true;
-        // Expired invites are no longer respondable — drop the server-only secret
+      if (invite.expiresAt < now) {
+        // Drop secrets after expiry for any status (incl. accepted held for join retry)
         deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+        if (invite.status === InviteStatus.PENDING) {
+          invite.status = InviteStatus.EXPIRED;
+          hasExpired = true;
+        }
       }
       // Only return pending invites by default (password never in owner storage)
       if (invite.status === InviteStatus.PENDING) {
@@ -887,6 +889,38 @@ function rpcRespondInvite(
     }
 
     const invite = invites[inviteIndex];
+    const now = Date.now();
+
+    // Accept retry: after a successful accept the secret is retained until
+    // expiry so join/notification failures can re-fetch the password.
+    if (accept && invite.status === InviteStatus.ACCEPTED) {
+      if (invite.expiresAt < now) {
+        invite.status = InviteStatus.EXPIRED;
+        writeInvites(nk, ctx.userId, 'received', invites);
+        deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+        return JSON.stringify({
+          success: false,
+          error: 'Invite has expired',
+        });
+      }
+      const secretPassword = readInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+      const resolved = resolveAcceptInvitePassword(
+        invite.isPrivate,
+        secretPassword,
+        invite.password
+      );
+      if (!resolved.ok) {
+        return JSON.stringify({
+          success: false,
+          error: resolved.error,
+        });
+      }
+      return JSON.stringify({
+        success: true,
+        matchId: invite.matchId,
+        password: resolved.password,
+      });
+    }
 
     // Check if already responded or expired
     if (invite.status !== InviteStatus.PENDING) {
@@ -896,7 +930,6 @@ function rpcRespondInvite(
       });
     }
 
-    const now = Date.now();
     if (invite.expiresAt < now) {
       invite.status = InviteStatus.EXPIRED;
       writeInvites(nk, ctx.userId, 'received', invites);
@@ -907,12 +940,17 @@ function rpcRespondInvite(
       });
     }
 
-    // Private accept: validate server-only secret BEFORE committing ACCEPTED
-    // so a missing secret leaves the invite pending and retryable.
+    // Private accept: validate password BEFORE committing ACCEPTED so a
+    // missing secret leaves the invite pending and retryable. Legacy pending
+    // invites may still carry an inline password without isPrivate/secret.
     let password: string | undefined;
     if (accept) {
       const secretPassword = readInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
-      const resolved = resolveAcceptInvitePassword(invite.isPrivate, secretPassword);
+      const resolved = resolveAcceptInvitePassword(
+        invite.isPrivate,
+        secretPassword,
+        invite.password
+      );
       if (!resolved.ok) {
         return JSON.stringify({
           success: false,
@@ -920,6 +958,11 @@ function rpcRespondInvite(
         });
       }
       password = resolved.password;
+      // Migrate legacy inline password into server-only storage for join retries
+      if (password && !secretPassword) {
+        writeInvitePasswordSecret(nk, invite.inviteId, invite.senderId, password);
+        invite.isPrivate = true;
+      }
     }
 
     // Update invite status
@@ -932,11 +975,17 @@ function rpcRespondInvite(
     const senderInviteIndex = senderInvites.findIndex(i => i.inviteId === inviteId);
     if (senderInviteIndex !== -1) {
       senderInvites[senderInviteIndex].status = newStatus;
+      if (accept && password && !senderInvites[senderInviteIndex].isPrivate) {
+        senderInvites[senderInviteIndex].isPrivate = true;
+      }
       writeInvites(nk, invite.senderId, 'sent', senderInvites);
     }
 
-    // Always clear the secret after a successful respond
-    deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+    // Decline/cancel paths clear the secret; accept retains it until expiry
+    // so the invitee can re-fetch after a failed join or notification error.
+    if (!accept) {
+      deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+    }
 
     // Notify sender about the response
     const notificationCode = accept ? 82 : 83; // INVITE_ACCEPTED or INVITE_DECLINED
@@ -961,7 +1010,7 @@ function rpcRespondInvite(
       return JSON.stringify({
         success: true,
         matchId: invite.matchId,
-        password, // From server-only secret store for private rooms
+        password, // From server-only secret store (or legacy migration) for private rooms
       });
     }
 
