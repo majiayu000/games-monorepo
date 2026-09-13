@@ -28,6 +28,7 @@ import {
   markInviteSecretCleanupComplete,
   applyInviteSecretCleanupMarkers,
   mergeCleanupTombstoneIntoInviteList,
+  needsSenderExpiryReceiverRecheck,
   needsTerminalSecretCleanup,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
@@ -1135,6 +1136,70 @@ describe('invite password attachment from matchSignal', () => {
     expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.ACCEPTED)).toBe(false);
     expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.PENDING)).toBe(true);
     expect(shouldDeleteSecretAfterSenderExpiry(undefined)).toBe(true);
+  });
+
+  it('sent-side EXPIRED terminal cleanup rechecks the receiver instead of deleting', () => {
+    const now = Date.now();
+    const secretStore: Record<string, { password: string }> = {
+      'inv-sent-expired': { password: 'join-retry-secret' },
+    };
+    // Prior poll claimed EXPIRED but receiver consult failed — durable sender
+    // row is EXPIRED with isPrivate still set.
+    const sentInvite: GameInvite = {
+      inviteId: 'inv-sent-expired',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.EXPIRED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now - 1,
+      isPrivate: true,
+    };
+    const receiverAccepted: InviteStatus = InviteStatus.ACCEPTED;
+
+    expect(needsTerminalSecretCleanup(sentInvite, now)).toBe(true);
+    expect(needsSenderExpiryReceiverRecheck('sent', sentInvite, now)).toBe(true);
+    expect(needsSenderExpiryReceiverRecheck('received', sentInvite, now)).toBe(false);
+
+    // Simulate get_invites({type:'sent'}) next-poll classification
+    const type: 'sent' | 'received' = 'sent';
+    const expiredClaimIds: string[] = [];
+    let deletedViaGenericTerminalCleanup = false;
+
+    if (sentInvite.expiresAt < now && canExpireInviteStatus(sentInvite.status)) {
+      sentInvite.status = InviteStatus.EXPIRED;
+      expiredClaimIds.push(sentInvite.inviteId);
+    } else if (needsSenderExpiryReceiverRecheck(type, sentInvite, now)) {
+      expiredClaimIds.push(sentInvite.inviteId);
+    } else if (needsTerminalSecretCleanup(sentInvite, now)) {
+      delete secretStore[sentInvite.inviteId];
+      markInviteSecretCleanupComplete(sentInvite);
+      deletedViaGenericTerminalCleanup = true;
+    }
+
+    expect(deletedViaGenericTerminalCleanup).toBe(false);
+    expect(expiredClaimIds).toEqual(['inv-sent-expired']);
+
+    // Re-run sender-expiry receiver coordination before any delete
+    for (const inviteId of expiredClaimIds) {
+      if (type === 'sent') {
+        if (!shouldDeleteSecretAfterSenderExpiry(receiverAccepted)) {
+          sentInvite.status = InviteStatus.ACCEPTED;
+          continue;
+        }
+      }
+      delete secretStore[inviteId];
+      markInviteSecretCleanupComplete(sentInvite);
+    }
+
+    expect(sentInvite.status).toBe(InviteStatus.ACCEPTED);
+    expect(secretStore['inv-sent-expired']).toEqual({ password: 'join-retry-secret' });
+    expect(sentInvite.isPrivate).toBe(true);
   });
 
   it('cleanup tombstones sit outside the user-visible history cap', () => {

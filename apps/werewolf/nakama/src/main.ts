@@ -47,6 +47,7 @@ import {
   applyInviteSecretCleanupMarkers,
   markInviteSecretCleanupComplete,
   mergeCleanupTombstoneIntoInviteList,
+  needsSenderExpiryReceiverRecheck,
   needsTerminalSecretCleanup,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
@@ -968,6 +969,18 @@ function rpcGetInvites(
         // Claim EXPIRED with OCC before deleting credentials so a concurrent
         // accept that wins the versioned write keeps its password.
         invite.status = InviteStatus.EXPIRED;
+        needsWrite = true;
+        expiredClaimIds.push(invite.inviteId);
+      } else if (
+        needsSenderExpiryReceiverRecheck(
+          type === 'sent' ? 'sent' : 'received',
+          invite,
+          now
+        )
+      ) {
+        // Prior poll claimed EXPIRED but receiver consult/sync failed. Do not
+        // delete via generic terminal cleanup — re-queue sender-expiry
+        // coordination so an ACCEPTED receiver keeps the join-retry password.
         needsWrite = true;
         expiredClaimIds.push(invite.inviteId);
       } else if (needsTerminalSecretCleanup(invite, now)) {

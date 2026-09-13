@@ -245,6 +245,24 @@ export function shouldDeleteSecretAfterSenderExpiry(
 }
 
 /**
+ * Sent-side EXPIRED private rows must not use the generic terminal cleanup
+ * path. A prior poll may have claimed EXPIRED while the receiver consult
+ * failed; the receiver can still be ACCEPTED and need the shared password
+ * for join retry. Re-queue through sender-expiry receiver coordination.
+ */
+export function needsSenderExpiryReceiverRecheck(
+  listType: 'sent' | 'received',
+  invite: GameInvite,
+  now: number
+): boolean {
+  return (
+    listType === 'sent' &&
+    invite.status === InviteStatus.EXPIRED &&
+    needsTerminalSecretCleanup(invite, now)
+  );
+}
+
+/**
  * Pending-slot OCC conflicts are not proof the list is full — retry while the
  * refreshed sender list still has capacity.
  */
