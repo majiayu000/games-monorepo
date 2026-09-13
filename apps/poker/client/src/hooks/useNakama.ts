@@ -266,8 +266,12 @@ export function useNakama() {
 
       case OpCode.SPECTATOR_LEFT: {
         const spectatorData = data as ServerSpectatorLeftData
+        const { userId } = useGameStore.getState()
         console.log('Spectator left:', spectatorData.displayName)
         removeSpectator(spectatorData.odid)
+        if (spectatorData.odid === userId) {
+          setIsSpectator(false)
+        }
         addChatMessage('system', 'System', `${spectatorData.displayName} stopped watching`)
         break
       }
@@ -292,8 +296,8 @@ export function useNakama() {
         const { userId } = useGameStore.getState()
         console.log('Spectator list:', listData.spectators)
         setSpectators(listData.spectators.map(s => ({ id: s.odid, name: s.displayName })))
-        if (userId && listData.spectators.some((s) => s.odid === userId)) {
-          setIsSpectator(true)
+        if (userId) {
+          setIsSpectator(listData.spectators.some((s) => s.odid === userId))
         }
         break
       }
@@ -576,13 +580,16 @@ export function useNakama() {
       const match = await socketRef.current.joinMatch(targetMatchId)
       setMatchId(match.match_id)
       setConnectionState('in_match')
+      // Reset sticky spectator role until this match's SPECTATOR_* events say otherwise
+      setIsSpectator(false)
+      setSpectators([])
       console.log('Joined match:', match.match_id)
       return match
     } catch (error) {
       console.error('Failed to join match:', error)
       throw error
     }
-  }, [setMatchId, setConnectionState])
+  }, [setMatchId, setConnectionState, setIsSpectator, setSpectators])
 
   // Leave current match
   const leaveMatch = useCallback(async () => {
@@ -594,11 +601,13 @@ export function useNakama() {
       setConnectionState('connected')
       setTurnInfo(null)
       clearHandResult()
+      setIsSpectator(false)
+      setSpectators([])
       console.log('Left match')
     } catch (error) {
       console.error('Failed to leave match:', error)
     }
-  }, [matchId, setMatchId, setConnectionState, setTurnInfo, clearHandResult])
+  }, [matchId, setMatchId, setConnectionState, setTurnInfo, clearHandResult, setIsSpectator, setSpectators])
 
   // Send player action
   const sendAction = useCallback(async (action: PlayerAction) => {

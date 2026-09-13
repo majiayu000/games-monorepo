@@ -138,6 +138,12 @@ export interface GameState {
   // Round tracking
   handNumber: number;
   actionsThisRound: number;
+
+  /**
+   * When true, post-hand escrow checkpoint failed and new hands must not start
+   * until a successful retry so reconciliation cannot refund a stale distribution.
+   */
+  escrowCheckpointFailed?: boolean;
 }
 
 // Messages from client to server

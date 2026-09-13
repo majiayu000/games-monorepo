@@ -8,6 +8,7 @@ import {
   claimDailyRewardRpc,
   clearMatchEscrow,
   creditCashOut,
+  creditCashOutWithEscrowSettle,
   debitBuyIn,
   debitBuyInWithEscrow,
   ensurePokerLeaderboard,
@@ -373,6 +374,60 @@ describe('match escrow', () => {
     expect(objects).toHaveLength(2);
     expect(objects.find((o: StoredObject) => o.userId === 'user1').value.amount).toBe(1100);
     expect(objects.find((o: StoredObject) => o.userId === 'user2').value.amount).toBe(900);
+  });
+
+  it('settles escrow atomically with cash-out so reconcile cannot double-credit', () => {
+    const nk = createMockNk({ user1: 4000 }, { matchesAlive: {} });
+    writeMatchEscrow(nk, 'match-1', 'user1', 1000, logger);
+
+    creditCashOutWithEscrowSettle(nk, 'match-1', 'user1', 1000, logger);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
+
+    // Even if delete failed and the settled marker remained, reconciler must not refund again.
+    // Simulate leftover settled record:
+    writeMatchEscrow(nk, 'match-1', 'user1', 1000, logger);
+    const objects = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: 'escrow:match-1', userId: 'user1' },
+    ]);
+    objects[0].value.status = 'settled';
+    (nk.storageWrite as Function)([
+      {
+        collection: 'match_escrow',
+        key: 'escrow:match-1',
+        userId: 'user1',
+        value: objects[0].value,
+        version: objects[0].version,
+      },
+    ]);
+
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger);
+    expect(refunded).toBe(0);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
+  });
+
+  it('does not double-credit when cash-out settle is retried after crash', () => {
+    const nk = createMockNk({ user1: 4000 });
+    writeMatchEscrow(nk, 'match-1', 'user1', 1000, logger);
+
+    creditCashOutWithEscrowSettle(nk, 'match-1', 'user1', 1000, logger);
+    // Force a settled leftover marker as if clearMatchEscrow failed
+    writeMatchEscrow(nk, 'match-1', 'user1', 1000, logger);
+    const objects = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: 'escrow:match-1', userId: 'user1' },
+    ]);
+    (nk.storageWrite as Function)([
+      {
+        collection: 'match_escrow',
+        key: 'escrow:match-1',
+        userId: 'user1',
+        value: { ...objects[0].value, status: 'settled' },
+        version: objects[0].version,
+      },
+    ]);
+
+    const second = creditCashOutWithEscrowSettle(nk, 'match-1', 'user1', 1000, logger);
+    expect(second.change).toBe(0);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
   });
 });
 

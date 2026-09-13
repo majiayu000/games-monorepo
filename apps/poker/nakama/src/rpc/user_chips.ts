@@ -677,6 +677,126 @@ export function creditCashOut(
 }
 
 /**
+ * Atomically credit table chips to the wallet and mark match escrow settled.
+ * Prevents double-credit if escrow deletion fails after a successful cash-out:
+ * reconciler only refunds `active` escrow, and a settled claim is idempotent.
+ */
+export function creditCashOutWithEscrowSettle(
+  nk: nkruntime.Nakama,
+  matchId: string,
+  userId: string,
+  amount: number,
+  logger: nkruntime.Logger
+): WalletMutationResult {
+  if (!matchId || !userId) {
+    throw new Error('Match id and user id are required for escrowed cash-out');
+  }
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0) {
+    throw new Error('Cash out amount must be non-negative');
+  }
+
+  const credit = Math.floor(amount);
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= WALLET_WRITE_MAX_ATTEMPTS; attempt++) {
+    try {
+      const escrowObjects = nk.storageRead([
+        {
+          collection: ESCROW_COLLECTION,
+          key: escrowKey(matchId),
+          userId,
+        },
+      ]);
+
+      const escrowObj = escrowObjects.length > 0 ? escrowObjects[0] : null;
+      const escrow = escrowObj?.value
+        ? (escrowObj.value as MatchEscrowRecord)
+        : null;
+
+      // Already settled in a prior attempt that crashed before seat removal — do not credit again.
+      if (escrow && escrow.status === 'settled') {
+        clearMatchEscrow(nk, matchId, userId, logger);
+        const stored = getUserChips(nk, userId, logger);
+        return {
+          balance: stored.data.balance,
+          previousBalance: stored.data.balance,
+          change: 0,
+        };
+      }
+
+      // No active escrow record — fall back to a plain wallet credit.
+      if (!escrow || escrow.status !== 'active') {
+        if (credit > 0) {
+          return creditCashOut(nk, userId, credit, logger);
+        }
+        const balance = getUserChips(nk, userId, logger).data.balance;
+        return { balance, previousBalance: balance, change: 0 };
+      }
+
+      const stored = getUserChips(nk, userId, logger);
+      const previousBalance = stored.data.balance;
+      const nextWallet: UserChipsData = {
+        ...stored.data,
+        balance: previousBalance + credit,
+      };
+      nextWallet.lastUpdated = Date.now();
+
+      const settled: MatchEscrowRecord = {
+        ...escrow,
+        amount: credit,
+        status: 'settled',
+        updatedAt: Date.now(),
+      };
+
+      // Single multi-object write: wallet credit + escrow settle succeed or fail together
+      nk.storageWrite([
+        {
+          collection: CHIPS_COLLECTION,
+          key: CHIPS_KEY,
+          userId,
+          value: nextWallet,
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: stored.version,
+        },
+        {
+          collection: ESCROW_COLLECTION,
+          key: escrowKey(matchId),
+          userId,
+          value: settled,
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: escrowObj!.version || '*',
+        },
+      ]);
+
+      // Best-effort cleanup of the settled claim marker (safe if this fails)
+      clearMatchEscrow(nk, matchId, userId, logger);
+
+      logger.info(
+        `User ${userId} cash-out with escrow settle in ${matchId}: ${previousBalance} -> ${nextWallet.balance} (amount: ${credit})`
+      );
+
+      return {
+        balance: nextWallet.balance,
+        previousBalance,
+        change: nextWallet.balance - previousBalance,
+      };
+    } catch (e) {
+      lastError = e;
+      if (!isVersionConflict(e) || attempt === WALLET_WRITE_MAX_ATTEMPTS) {
+        throw e;
+      }
+      logger.warn(
+        `Escrowed cash-out conflict for ${userId} match ${matchId}, retrying (${attempt}/${WALLET_WRITE_MAX_ATTEMPTS})`
+      );
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/**
  * Get user's chip balance and stats.
  * Also reconciles orphaned match escrow left behind by crash/shutdown.
  */

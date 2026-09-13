@@ -24,8 +24,7 @@ import { executePlayerAction, autoFold, getActionInfo } from './betting';
 import { evaluateHand, compareEvaluatedHands, EvaluatedHand, getHandRankName } from './hand_evaluator';
 import {
   clampStartingChips,
-  clearMatchEscrow,
-  creditCashOut,
+  creditCashOutWithEscrowSettle,
   debitBuyInWithEscrow,
   getWalletBalance,
   recordHandStatistics,
@@ -654,7 +653,9 @@ function hasDisconnectedPlayerTimedOut(player: Player, tick: number): boolean {
 }
 
 /**
- * Handle disconnected players who have exceeded grace period
+ * Handle disconnected players who have exceeded grace period.
+ * Returns true only when an auto-fold actually succeeded and post-action
+ * flow must advance the hand — not for every disconnect settlement.
  */
 function handleDisconnectedPlayers(
   state: GameState,
@@ -663,7 +664,7 @@ function handleDisconnectedPlayers(
   nk: nkruntime.Nakama,
   tick: number
 ): boolean {
-  let stateChanged = false;
+  let autoFoldSucceeded = false;
 
   Object.entries(state.players).forEach(([odid, player]) => {
     if (hasDisconnectedPlayerTimedOut(player, tick)) {
@@ -683,7 +684,7 @@ function handleDisconnectedPlayers(
             timeout: true,
             disconnected: true
           });
-          stateChanged = true;
+          autoFoldSucceeded = true;
         }
       }
 
@@ -718,12 +719,10 @@ function handleDisconnectedPlayers(
           reason: 'disconnect_timeout_pending_hand'
         });
       }
-
-      stateChanged = true;
     }
   });
 
-  return stateChanged;
+  return autoFoldSucceeded;
 }
 
 function getWalletBalanceSafe(
@@ -739,8 +738,8 @@ function getWalletBalanceSafe(
 }
 
 /**
- * Credit remaining table chips back to the persisted wallet and clear escrow.
- * Returns false when persistence fails so the caller can retain the table stack.
+ * Credit remaining table chips back to the persisted wallet and settle escrow
+ * atomically. Returns false when persistence fails so the caller retains the stack.
  */
 function cashOutPlayer(
   nk: nkruntime.Nakama,
@@ -750,10 +749,7 @@ function cashOutPlayer(
   logger: nkruntime.Logger
 ): boolean {
   try {
-    if (chips > 0) {
-      creditCashOut(nk, userId, chips, logger);
-    }
-    clearMatchEscrow(nk, matchId, userId, logger);
+    creditCashOutWithEscrowSettle(nk, matchId, userId, chips, logger);
     return true;
   } catch (e) {
     logger.error('Failed to credit cash-out; retaining table stack', {
@@ -828,15 +824,57 @@ function settlePendingLeaves(
       player.currentBet = 0;
     }
     // Atomic multi-object checkpoint — avoids mixed pre/post-hand escrow on crash.
+    // On failure, pause new hands until retry succeeds (fail-closed).
+    try {
+      writeMatchEscrowBatch(
+        nk,
+        state.matchId,
+        remaining.map(([userId, player]) => ({ userId, amount: player.chips })),
+        logger
+      );
+      state.escrowCheckpointFailed = false;
+    } catch (e) {
+      state.escrowCheckpointFailed = true;
+      logger.error('Post-hand escrow checkpoint failed; pausing new hands until retry succeeds', {
+        matchId: state.matchId,
+        error: e,
+      });
+    }
+  }
+
+  updateMatchLabel(state, dispatcher);
+}
+
+/**
+ * Retry a failed post-hand escrow checkpoint. Returns true when cleared or unused.
+ */
+function retryEscrowCheckpointIfNeeded(
+  state: GameState,
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger
+): boolean {
+  if (!state.escrowCheckpointFailed) {
+    return true;
+  }
+
+  const remaining = Object.entries(state.players);
+  try {
     writeMatchEscrowBatch(
       nk,
       state.matchId,
       remaining.map(([userId, player]) => ({ userId, amount: player.chips })),
       logger
     );
+    state.escrowCheckpointFailed = false;
+    logger.info('Post-hand escrow checkpoint retry succeeded', { matchId: state.matchId });
+    return true;
+  } catch (e) {
+    logger.warn('Post-hand escrow checkpoint retry still failing; match remains paused', {
+      matchId: state.matchId,
+      error: e,
+    });
+    return false;
   }
-
-  updateMatchLabel(state, dispatcher);
 }
 
 interface HandContributionSnapshot {
@@ -999,9 +1037,9 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
 ): { state: GameState } | null {
 
   // Handle disconnected players who have exceeded grace period
-  const disconnectHandled = handleDisconnectedPlayers(state, dispatcher, logger, nk, tick);
-  if (disconnectHandled) {
-    // Check if we need to handle post-action logic after auto-fold
+  const disconnectAutoFolded = handleDisconnectedPlayers(state, dispatcher, logger, nk, tick);
+  if (disconnectAutoFolded) {
+    // Only advance the hand when auto-fold actually succeeded for the current actor
     handlePostAction(state, dispatcher, logger, tick, nk);
   }
 
@@ -1076,6 +1114,11 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
   // Game phase logic
   switch (state.phase) {
     case GamePhase.Waiting:
+      // Fail-closed: do not start a new hand until post-hand escrow is checkpointed
+      if (!retryEscrowCheckpointIfNeeded(state, nk, logger)) {
+        break;
+      }
+
       // Check if we have enough players to start
       const eligiblePlayers = getEligiblePlayers(state);
 
