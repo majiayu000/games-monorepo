@@ -31,6 +31,7 @@ import {
   buildGetPasswordSignal,
   inviteForOwnerStorage,
   inviteMayRetainPasswordSecret,
+  inviteSecretCleanupTombstone,
   invitesDroppedByHistoryCap,
   isAtPendingInviteLimit,
   isBenignStorageDeleteError,
@@ -41,9 +42,10 @@ import {
   legacyInlineInvitePassword,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
+  shouldBlockCancelForAcceptedReceiver,
   shouldDeleteSecretAfterHistoryCap,
   shouldDeleteSecretAfterSendRollback,
-  withoutInviteId,
+  shouldDeleteSecretAfterTerminalCommit,
 } from './werewolf/invite-password';
 
 // Storage collection for user stats
@@ -774,6 +776,10 @@ function rpcSendInvite(
     let secretWritten = false;
     let senderInviteWritten = false;
     let receiverInviteWritten = false;
+    // Pre-write snapshots for safe rollback — never re-read during rollback
+    // because readInvites swallows errors into [] and would wipe history.
+    const senderInvitesSnapshot = senderInvites.slice();
+    let receiverInvitesSnapshot: GameInvite[] | null = null;
     if (invitePassword) {
       invite.isPrivate = true;
       writeInvitePasswordSecret(nk, inviteId, ctx.userId, invitePassword);
@@ -782,14 +788,14 @@ function rpcSendInvite(
 
     try {
       // Store invite for sender (sent invites)
-      senderInvites.push(invite);
-      writeInvites(nk, ctx.userId, 'sent', senderInvites);
+      const senderInvitesToWrite = [...senderInvitesSnapshot, invite];
+      writeInvites(nk, ctx.userId, 'sent', senderInvitesToWrite);
       senderInviteWritten = true;
 
       // Store invite for receiver (received invites)
-      const receiverInvites = readInvites(nk, receiverId, 'received');
-      receiverInvites.push(invite);
-      writeInvites(nk, receiverId, 'received', receiverInvites);
+      receiverInvitesSnapshot = readInvites(nk, receiverId, 'received');
+      const receiverInvitesToWrite = [...receiverInvitesSnapshot, invite];
+      writeInvites(nk, receiverId, 'received', receiverInvitesToWrite);
       receiverInviteWritten = true;
 
       // Send notification to receiver
@@ -812,21 +818,16 @@ function rpcSendInvite(
       let receiverInviteRolledBack = !receiverInviteWritten;
       try {
         if (receiverInviteWritten) {
-          writeInvites(
-            nk,
-            receiverId,
-            'received',
-            withoutInviteId(readInvites(nk, receiverId, 'received'), inviteId)
-          );
+          if (receiverInvitesSnapshot === null) {
+            throw new Error(
+              `Cannot roll back receiver invites for ${inviteId}: missing pre-write snapshot`
+            );
+          }
+          writeInvites(nk, receiverId, 'received', receiverInvitesSnapshot);
           receiverInviteRolledBack = true;
         }
         if (senderInviteWritten) {
-          writeInvites(
-            nk,
-            ctx.userId,
-            'sent',
-            withoutInviteId(readInvites(nk, ctx.userId, 'sent'), inviteId)
-          );
+          writeInvites(nk, ctx.userId, 'sent', senderInvitesSnapshot);
           senderInviteRolledBack = true;
         }
       } catch (rollbackError) {
@@ -843,7 +844,21 @@ function rpcSendInvite(
         try {
           deleteInvitePasswordSecret(nk, inviteId, ctx.userId);
         } catch (secretRollbackError) {
-          logger.error(`Failed to delete orphan invite secret ${inviteId}: ${secretRollbackError}`);
+          // Rows are gone — persist a terminal private tombstone so get_invites
+          // retains the inviteId and can retry orphan secret cleanup.
+          logger.error(
+            `Failed to delete orphan invite secret ${inviteId}: ${secretRollbackError}`
+          );
+          try {
+            writeInvites(nk, ctx.userId, 'sent', [
+              ...senderInvitesSnapshot,
+              inviteSecretCleanupTombstone(invite),
+            ]);
+          } catch (tombstoneError) {
+            logger.error(
+              `Failed to retain cleanup tombstone for orphan secret ${inviteId}: ${tombstoneError}`
+            );
+          }
         }
       } else if (secretWritten) {
         logger.warn(
@@ -1055,19 +1070,15 @@ function rpcRespondInvite(
       }
     }
 
-    // Decline clears the secret before committing terminal status so a
-    // transient storageDelete failure leaves the invite pending and retryable.
-    // Accept retains the secret until expiry for join retries.
-    if (!accept) {
-      deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
-    }
-
-    // Update invite status
+    // Commit terminal / accepted status before secret deletion. Decline/cancel
+    // delete afterward so a failed list write cannot leave PENDING without a
+    // password; get_invites retries orphan secret cleanup for terminal rows.
+    const previousStatus = invite.status;
     const newStatus = accept ? InviteStatus.ACCEPTED : InviteStatus.DECLINED;
     invite.status = newStatus;
     writeInvites(nk, ctx.userId, 'received', invites);
 
-    // Update sender's copy
+    // Update sender's copy (accept: receiver is authoritative if this fails)
     const senderInvites = readInvites(nk, invite.senderId, 'sent');
     const senderInviteIndex = senderInvites.findIndex(i => i.inviteId === inviteId);
     if (senderInviteIndex !== -1) {
@@ -1076,6 +1087,16 @@ function rpcRespondInvite(
         senderInvites[senderInviteIndex].isPrivate = true;
       }
       writeInvites(nk, invite.senderId, 'sent', senderInvites);
+    }
+
+    if (shouldDeleteSecretAfterTerminalCommit(previousStatus, newStatus)) {
+      try {
+        deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+      } catch (cleanupError) {
+        logger.warn(
+          `Retryable decline secret cleanup failed for ${invite.inviteId}: ${cleanupError}`
+        );
+      }
     }
 
     // Notify sender about the response
@@ -1157,7 +1178,7 @@ function rpcCancelInvite(
 
     const invite = invites[inviteIndex];
 
-    // Can only cancel pending invites
+    // Can only cancel pending invites on the sender copy
     if (invite.status !== InviteStatus.PENDING) {
       return JSON.stringify({
         success: false,
@@ -1165,23 +1186,46 @@ function rpcCancelInvite(
       });
     }
 
-    // Delete secret first while still PENDING so transient delete failures
-    // remain retryable. Strip inline password before list writes so legacy
-    // migration cannot recreate the secret after a successful delete.
-    invite.password = undefined;
-    deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+    // Receiver is authoritative after a partial accept: if the receiver already
+    // accepted but the sender write failed, do not delete the retained password.
+    const receiverInvites = readInvites(nk, invite.receiverId, 'received');
+    const receiverInviteIndex = receiverInvites.findIndex(i => i.inviteId === inviteId);
+    const receiverStatus =
+      receiverInviteIndex !== -1 ? receiverInvites[receiverInviteIndex].status : undefined;
+    if (shouldBlockCancelForAcceptedReceiver(invite.status, receiverStatus)) {
+      invite.status = InviteStatus.ACCEPTED;
+      if (receiverInvites[receiverInviteIndex].isPrivate) {
+        invite.isPrivate = true;
+      }
+      invite.password = undefined;
+      writeInvites(nk, ctx.userId, 'sent', invites);
+      return JSON.stringify({
+        success: false,
+        error: 'Invite was already accepted',
+      });
+    }
 
-    // Update invite status
+    // Commit CANCELLED on both lists before deleting the secret so a failed
+    // write cannot leave a still-PENDING invite without its password.
+    const previousStatus = invite.status;
+    invite.password = undefined;
     invite.status = InviteStatus.CANCELLED;
     writeInvites(nk, ctx.userId, 'sent', invites);
 
-    // Update receiver's copy
-    const receiverInvites = readInvites(nk, invite.receiverId, 'received');
-    const receiverInviteIndex = receiverInvites.findIndex(i => i.inviteId === inviteId);
     if (receiverInviteIndex !== -1) {
       receiverInvites[receiverInviteIndex].password = undefined;
       receiverInvites[receiverInviteIndex].status = InviteStatus.CANCELLED;
       writeInvites(nk, invite.receiverId, 'received', receiverInvites);
+    }
+
+    if (shouldDeleteSecretAfterTerminalCommit(previousStatus, InviteStatus.CANCELLED)) {
+      try {
+        deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+      } catch (cleanupError) {
+        logger.warn(
+          `Retryable cancel secret cleanup failed for ${invite.inviteId}: ${cleanupError}`
+        );
+      }
     }
 
     // Notify receiver about cancellation

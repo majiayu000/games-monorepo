@@ -166,6 +166,50 @@ export function shouldDeleteSecretAfterSendRollback(
 }
 
 /**
+ * When send-rollback secret deletion fails after both invite rows are gone,
+ * keep a terminal private tombstone so get_invites can retry cleanup.
+ */
+export function inviteSecretCleanupTombstone(invite: GameInvite): GameInvite {
+  return inviteForOwnerStorage({
+    ...invite,
+    status: InviteStatus.CANCELLED,
+    isPrivate: true,
+    password: undefined,
+  });
+}
+
+/**
+ * Sender cancel must not wipe a password while the receiver already accepted
+ * (partial accept left the sender copy pending).
+ */
+export function shouldBlockCancelForAcceptedReceiver(
+  senderStatus: InviteStatus,
+  receiverStatus: InviteStatus | undefined
+): boolean {
+  return (
+    senderStatus === InviteStatus.PENDING &&
+    receiverStatus === InviteStatus.ACCEPTED
+  );
+}
+
+/**
+ * Terminal decline/cancel: commit durable status first, then delete the secret.
+ * Transient delete failures stay retryable via get_invites orphan cleanup.
+ */
+export function shouldDeleteSecretAfterTerminalCommit(
+  previousStatus: InviteStatus,
+  nextStatus: InviteStatus
+): boolean {
+  if (previousStatus !== InviteStatus.PENDING) {
+    return false;
+  }
+  return (
+    nextStatus === InviteStatus.DECLINED ||
+    nextStatus === InviteStatus.CANCELLED
+  );
+}
+
+/**
  * Accept path: private invites must resolve a non-empty password before the
  * invite may be committed as ACCEPTED.
  *

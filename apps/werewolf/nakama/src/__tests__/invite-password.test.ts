@@ -9,6 +9,7 @@ import {
   handleMatchSignalPayload,
   inviteForOwnerStorage,
   inviteMayRetainPasswordSecret,
+  inviteSecretCleanupTombstone,
   invitesDroppedByHistoryCap,
   isAtPendingInviteLimit,
   isBenignStorageDeleteError,
@@ -19,8 +20,10 @@ import {
   legacyInlineInvitePassword,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
+  shouldBlockCancelForAcceptedReceiver,
   shouldDeleteSecretAfterHistoryCap,
   shouldDeleteSecretAfterSendRollback,
+  shouldDeleteSecretAfterTerminalCommit,
   withoutInviteId,
   MATCH_SIGNAL_GET_PASSWORD,
 } from '../werewolf/invite-password';
@@ -620,7 +623,7 @@ describe('invite password attachment from matchSignal', () => {
     expect(isBenignStorageDeleteError('')).toBe(false);
   });
 
-  it('decline/cancel delete failures stay retryable until terminal status is written', () => {
+  it('decline/cancel commit terminal status before secret deletion', () => {
     const secretStore: Record<string, { password: string }> = {
       'inv-decline': { password: 'room-pass' },
     };
@@ -640,7 +643,21 @@ describe('invite password attachment from matchSignal', () => {
       isPrivate: true,
     };
 
-    // Simulate transient delete failure before status update
+    expect(
+      shouldDeleteSecretAfterTerminalCommit(InviteStatus.PENDING, InviteStatus.DECLINED)
+    ).toBe(true);
+    expect(
+      shouldDeleteSecretAfterTerminalCommit(InviteStatus.PENDING, InviteStatus.CANCELLED)
+    ).toBe(true);
+    expect(
+      shouldDeleteSecretAfterTerminalCommit(InviteStatus.PENDING, InviteStatus.ACCEPTED)
+    ).toBe(false);
+
+    // Commit terminal first — even if delete fails, status is durable and cleanup is retryable
+    const previousStatus = invite.status;
+    invite.status = InviteStatus.DECLINED;
+    expect(shouldDeleteSecretAfterTerminalCommit(previousStatus, invite.status)).toBe(true);
+
     const deleteOnce = (shouldFail: boolean) => {
       if (shouldFail) {
         const err = new Error('temporary storage unavailable');
@@ -652,13 +669,100 @@ describe('invite password attachment from matchSignal', () => {
     };
 
     expect(() => deleteOnce(true)).toThrow('temporary storage unavailable');
-    expect(invite.status).toBe(InviteStatus.PENDING);
+    expect(invite.status).toBe(InviteStatus.DECLINED);
     expect(secretStore['inv-decline']).toEqual({ password: 'room-pass' });
 
-    // Retry succeeds, then terminal status is committed
+    // get_invites orphan cleanup retries against the terminal private row
+    expect(inviteMayRetainPasswordSecret(invite, Date.now())).toBe(false);
     deleteOnce(false);
-    invite.status = InviteStatus.DECLINED;
     expect(secretStore['inv-decline']).toBeUndefined();
-    expect(invite.status).toBe(InviteStatus.DECLINED);
+  });
+
+  it('send rollback uses snapshots and retains a cleanup tombstone on secret delete failure', () => {
+    const secretStore: Record<string, { password: string }> = {
+      'inv-orphan': { password: 'left-behind' },
+    };
+    const priorSender: GameInvite[] = [
+      {
+        inviteId: 'inv-older',
+        matchId: 'm0',
+        roomName: 'Other',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: 'guest-0',
+        receiverName: 'Guest0',
+        status: InviteStatus.DECLINED,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: 1,
+        expiresAt: Date.now() + 60_000,
+      },
+    ];
+    const priorReceiver: GameInvite[] = [...priorSender];
+    const invite: GameInvite = {
+      inviteId: 'inv-orphan',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 2,
+      expiresAt: Date.now() + 60_000,
+      isPrivate: true,
+    };
+
+    // Snapshot-based rollback restores prior history (never empty-on-read-error wipe)
+    const senderSnapshot = priorSender.slice();
+    const receiverSnapshot = priorReceiver.slice();
+    const senderWritten = [...senderSnapshot, invite];
+    const receiverWritten = [...receiverSnapshot, invite];
+    expect(senderWritten).toHaveLength(2);
+    expect(withoutInviteId(senderWritten, invite.inviteId)).toEqual(senderSnapshot);
+
+    // After both rows rolled back, secret delete fails → keep tombstone for retry
+    expect(shouldDeleteSecretAfterSendRollback(true, true, true)).toBe(true);
+    const tombstone = inviteSecretCleanupTombstone(invite);
+    expect(tombstone.status).toBe(InviteStatus.CANCELLED);
+    expect(tombstone.isPrivate).toBe(true);
+    expect(tombstone.password).toBeUndefined();
+    expect(isInviteVisibleInGetInvites(tombstone, Date.now(), 'sent')).toBe(false);
+    expect(inviteMayRetainPasswordSecret(tombstone, Date.now())).toBe(false);
+
+    const senderAfterFailedSecretDelete = [...senderSnapshot, tombstone];
+    expect(senderAfterFailedSecretDelete.map((i) => i.inviteId)).toEqual([
+      'inv-older',
+      'inv-orphan',
+    ]);
+    // Polling cleanup can still discover the inviteId
+    delete secretStore['inv-orphan'];
+    expect(secretStore['inv-orphan']).toBeUndefined();
+    expect(receiverSnapshot).toHaveLength(1);
+  });
+
+  it('cancel consults receiver accepted status before deleting the secret', () => {
+    const secretStore: Record<string, { password: string }> = {
+      'inv-partial': { password: 'keep-for-join' },
+    };
+    expect(
+      shouldBlockCancelForAcceptedReceiver(InviteStatus.PENDING, InviteStatus.ACCEPTED)
+    ).toBe(true);
+    expect(
+      shouldBlockCancelForAcceptedReceiver(InviteStatus.PENDING, InviteStatus.PENDING)
+    ).toBe(false);
+    expect(
+      shouldBlockCancelForAcceptedReceiver(InviteStatus.PENDING, undefined)
+    ).toBe(false);
+
+    // Partial accept: sender still pending, receiver accepted — sync, do not delete
+    if (shouldBlockCancelForAcceptedReceiver(InviteStatus.PENDING, InviteStatus.ACCEPTED)) {
+      // secret retained for join retry
+    } else {
+      delete secretStore['inv-partial'];
+    }
+    expect(secretStore['inv-partial']).toEqual({ password: 'keep-for-join' });
   });
 });
