@@ -94,6 +94,7 @@ function createTestGameState(overrides: Partial<GameState> = {}): GameState {
     speakingOrder: [],
     currentSpeaker: null,
     sheriffId: null,
+    electedSheriffId: null,
     sheriffCampaignCandidates: [],
     sheriffVotes: new Map(),
     sheriffElectionDone: false,

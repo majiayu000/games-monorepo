@@ -422,7 +422,8 @@ export interface GameState {
   currentSpeaker: string | null;   // 当前发言人
 
   // 警长系统相关
-  sheriffId: string | null;                    // 当前警长ID
+  sheriffId: string | null;                    // 当前警长ID（可因移交/撕毁变化）
+  electedSheriffId: string | null;             // 竞选当选的警长（不随移交变化）
   sheriffCampaignCandidates: string[];         // 竞选候选人列表
   sheriffVotes: Map<string, string>;           // 警长投票记录 (voterId -> candidateId)
   sheriffElectionDone: boolean;                // 警长竞选是否已完成（第一天后为true）

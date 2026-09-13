@@ -135,6 +135,7 @@ export function createTestGameState(overrides: Partial<GameState> = {}): GameSta
     speakingOrder: overrides.speakingOrder || [],
     currentSpeaker: overrides.currentSpeaker || null,
     sheriffId: overrides.sheriffId || null,
+    electedSheriffId: overrides.electedSheriffId || null,
     sheriffCampaignCandidates: overrides.sheriffCampaignCandidates || [],
     sheriffVotes: overrides.sheriffVotes || new Map(),
     sheriffElectionDone: overrides.sheriffElectionDone || false,

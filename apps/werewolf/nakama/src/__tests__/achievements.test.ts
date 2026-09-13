@@ -226,4 +226,30 @@ describe('update_achievements RPC removal', () => {
     ).text();
     expect(mainSource).not.toContain("registerRpc('record_game_result'");
   });
+
+  it('recordGameStats awards match XP via calculateGameXP', async () => {
+    const handlerSource = await Bun.file(
+      new URL('../werewolf/match_handler.ts', import.meta.url)
+    ).text();
+    expect(handlerSource).toContain('calculateGameXP');
+    expect(handlerSource).toContain('calculateLevelInfo');
+    expect(handlerSource).toMatch(/stats\.totalXP\s*=\s*\(stats\.totalXP\s*\|\|\s*0\)\s*\+\s*xpGained/);
+  });
+
+  it('wasSheriff uses electedSheriffId, not transferable sheriffId', async () => {
+    const handlerSource = await Bun.file(
+      new URL('../werewolf/match_handler.ts', import.meta.url)
+    ).text();
+    const typesSource = await Bun.file(
+      new URL('../werewolf/types.ts', import.meta.url)
+    ).text();
+    expect(typesSource).toContain('electedSheriffId');
+    expect(handlerSource).toContain('electedSheriffId');
+    expect(handlerSource).toContain(
+      'player.oderId === (state.electedSheriffId ?? state.sheriffId)'
+    );
+    expect(handlerSource).not.toMatch(
+      /const wasSheriff = player\.oderId === state\.sheriffId;/
+    );
+  });
 });

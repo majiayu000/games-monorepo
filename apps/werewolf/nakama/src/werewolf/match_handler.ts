@@ -23,6 +23,8 @@ import {
   isWerewolf,
   PlayerExtendedState,
   createInitialUserStats,
+  calculateGameXP,
+  calculateLevelInfo,
   UserStats,
 } from './types';
 import { compressMessage, compressPlayerList } from './message-compress';
@@ -162,6 +164,7 @@ function createInitialState(matchId: string, params: { [key: string]: string }):
     currentSpeaker: null,
     // 警长系统相关
     sheriffId: null,
+    electedSheriffId: null,
     sheriffCampaignCandidates: [],
     sheriffVotes: new Map<string, string>(),
     sheriffElectionDone: false,
@@ -2432,17 +2435,11 @@ function recordGameStats(
         };
       });
 
-    // Call RPC to record stats (using server-to-server call)
-    const payload = JSON.stringify({
-      players: playerData,
-      winner,
-      sheriffId: state.sheriffId,
-    });
-
     // Use storageWrite directly for efficiency instead of RPC
     const STATS_COLLECTION = 'werewolf_stats';
     const STATS_KEY = 'user_stats';
     const now = Date.now();
+    const today = new Date().toISOString().split('T')[0];
     const writes: nkruntime.StorageWriteRequest[] = [];
 
     for (const player of playerData) {
@@ -2472,12 +2469,18 @@ function recordGameStats(
         stats = createInitialUserStats(player.oderId);
       }
 
+      const oldLevel = stats.level || 1;
+      // Use elected sheriff — transfer/destroy must not reassign election credit
+      const wasSheriff = player.oderId === (state.electedSheriffId ?? state.sheriffId);
+      const isFirstWinOfDay = player.isWinner && stats.lastWinDate !== today;
+
       // Update total stats
       stats.totalGames++;
       if (player.isWinner) {
         stats.wins++;
         stats.winStreak = (stats.winStreak || 0) + 1;
         stats.maxWinStreak = Math.max(stats.maxWinStreak || 0, stats.winStreak);
+        stats.lastWinDate = today;
       } else {
         stats.losses++;
         stats.winStreak = 0;
@@ -2485,6 +2488,23 @@ function recordGameStats(
       stats.winRate = stats.totalGames > 0
         ? Math.round((stats.wins / stats.totalGames) * 100)
         : 0;
+
+      // Award normal match XP (formerly only in unregistered record_game_result)
+      const xpGained = calculateGameXP({
+        won: player.isWinner,
+        survived: player.isAlive,
+        wasSheriff,
+        sheriffWon: wasSheriff && player.isWinner,
+        currentWinStreak: stats.winStreak,
+        isFirstWinOfDay,
+      });
+      stats.totalXP = (stats.totalXP || 0) + xpGained;
+      const levelInfo = calculateLevelInfo(stats.totalXP);
+      stats.level = levelInfo.level;
+      stats.currentXP = levelInfo.currentXP;
+      if (levelInfo.level > oldLevel) {
+        logger.info(`Player ${player.oderId} leveled up: ${oldLevel} -> ${levelInfo.level} (+${xpGained} XP)`);
+      }
 
       // Update survival rate
       const oldSurvivalWeight = (stats.totalGames - 1) * (stats.survivalRate || 0);
@@ -2523,7 +2543,6 @@ function recordGameStats(
       }
 
       // Update sheriff stats
-      const wasSheriff = player.oderId === state.sheriffId;
       if (wasSheriff) {
         stats.gamesAsSheriff++;
         if (player.isWinner) {
@@ -2564,7 +2583,7 @@ function recordGameStats(
         logger.error(`Failed to update achievements for ${player.oderId}: ${e}`);
       }
 
-      // Add to write batch (includes any XP from achievement unlocks)
+      // Add to write batch (includes match XP + any XP from achievement unlocks)
       writes.push({
         collection: STATS_COLLECTION,
         key: STATS_KEY,
@@ -2696,6 +2715,7 @@ function startSheriffSpeech(
     const winnerId = state.sheriffCampaignCandidates[0];
     const winner = state.players.get(winnerId);
     state.sheriffId = winnerId;
+    state.electedSheriffId = winnerId;
     state.sheriffElectionDone = true;
 
     logger.info(`${winner?.displayName} auto-elected as sheriff (only candidate)`);
@@ -2873,6 +2893,7 @@ function processSheriffVotes(
     logger.info('Sheriff election ended in tie, no sheriff elected');
   } else if (winnerId) {
     state.sheriffId = winnerId;
+    state.electedSheriffId = winnerId;
     const winner = state.players.get(winnerId);
     logger.info(`${winner?.displayName} elected as sheriff with ${maxVotes} votes`);
   }
