@@ -133,9 +133,9 @@ export function invitesDroppedByHistoryCap(
 }
 
 /**
- * Persist owner-readable history: cap regular rows, keep cleanup tombstones
- * outside that budget (themselves bounded) so orphan retries cannot evict
- * actionable invites.
+ * Persist owner-readable history: cap regular rows, keep every outstanding
+ * cleanup tombstone outside that budget so unresolved secret deletes are never
+ * silently dropped when more than `limit` orphans accumulate.
  */
 export function invitesForOwnerHistoryStorage(
   invites: GameInvite[],
@@ -143,7 +143,7 @@ export function invitesForOwnerHistoryStorage(
 ): GameInvite[] {
   const regular = invites.filter((invite) => !isInviteSecretCleanupOnly(invite));
   const cleanup = invites.filter((invite) => isInviteSecretCleanupOnly(invite));
-  return [...regular.slice(-limit), ...cleanup.slice(-limit)].map(inviteForOwnerStorage);
+  return [...regular.slice(-limit), ...cleanup].map(inviteForOwnerStorage);
 }
 
 /**
@@ -197,6 +197,61 @@ export function isAtPendingInviteLimit(
  */
 export function withoutInviteId(invites: GameInvite[], inviteId: string): GameInvite[] {
   return invites.filter((invite) => invite.inviteId !== inviteId);
+}
+
+/**
+ * Send-failure rollback may only remove the provisional row this send created.
+ * A concurrent accept that already committed ACCEPTED (or any terminal row)
+ * must be preserved so join retries keep their inviteId + secret.
+ */
+export function canRollbackSendInviteRow(status: InviteStatus): boolean {
+  return (
+    status === InviteStatus.SENDING ||
+    status === InviteStatus.PENDING
+  );
+}
+
+/**
+ * After a legacy migrate + OCC accept conflict, delete the migrated secret only
+ * when the winning durable row no longer needs credentials for join retry.
+ */
+export function shouldDeleteMigratedSecretAfterAcceptConflict(
+  winningStatus: InviteStatus | undefined,
+  now: number = Date.now(),
+  expiresAt?: number
+): boolean {
+  if (winningStatus === undefined) {
+    // Row gone (cancel/decline cleanup) — migrated secret would orphan.
+    return true;
+  }
+  if (typeof expiresAt === 'number' && expiresAt < now) {
+    return true;
+  }
+  return (
+    winningStatus !== InviteStatus.SENDING &&
+    winningStatus !== InviteStatus.PENDING &&
+    winningStatus !== InviteStatus.ACCEPTED
+  );
+}
+
+/**
+ * Sender-side expiry must not wipe credentials while the receiver already
+ * accepted on its independent storage object.
+ */
+export function shouldDeleteSecretAfterSenderExpiry(
+  receiverStatus: InviteStatus | undefined
+): boolean {
+  return receiverStatus !== InviteStatus.ACCEPTED;
+}
+
+/**
+ * Pending-slot OCC conflicts are not proof the list is full — retry while the
+ * refreshed sender list still has capacity.
+ */
+export function shouldRetryPendingInviteClaimAfterConflict(
+  refreshedListIsFull: boolean
+): boolean {
+  return !refreshedListIsFull;
 }
 
 /**

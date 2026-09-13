@@ -8,6 +8,7 @@ import {
   buildGetPasswordSignal,
   canCancelSenderInvite,
   canExpireInviteStatus,
+  canRollbackSendInviteRow,
   countsTowardPendingInviteLimit,
   handleMatchSignalPayload,
   inviteForOwnerStorage,
@@ -31,9 +32,12 @@ import {
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
   shouldBlockCancelForAcceptedReceiver,
+  shouldDeleteMigratedSecretAfterAcceptConflict,
   shouldDeleteSecretAfterHistoryCap,
   shouldDeleteSecretAfterSendRollback,
+  shouldDeleteSecretAfterSenderExpiry,
   shouldDeleteSecretAfterTerminalCommit,
+  shouldRetryPendingInviteClaimAfterConflict,
   storageWriteVersionFor,
   withoutInviteId,
   MATCH_SIGNAL_GET_PASSWORD,
@@ -1053,6 +1057,11 @@ describe('invite password attachment from matchSignal', () => {
     expect(isStorageVersionConflictError(new Error('version conflict'))).toBe(true);
   });
 
+  it('pending slot OCC conflict retries while capacity remains', () => {
+    expect(shouldRetryPendingInviteClaimAfterConflict(false)).toBe(true);
+    expect(shouldRetryPendingInviteClaimAfterConflict(true)).toBe(false);
+  });
+
   it('provisional SENDING blocks cancel and stays hidden until promoted', () => {
     const now = Date.now();
     const sending: GameInvite = {
@@ -1078,7 +1087,7 @@ describe('invite password attachment from matchSignal', () => {
     expect(canExpireInviteStatus(InviteStatus.SENDING)).toBe(true);
   });
 
-  it('legacy accept migrate secret is deleted when OCC claim loses', () => {
+  it('legacy accept migrate secret is deleted only when the winning row is terminal', () => {
     const secretStore: Record<string, { password: string }> = {};
     const legacyPassword = 'legacy-pass';
     let migratedLegacySecret = false;
@@ -1089,10 +1098,43 @@ describe('invite password attachment from matchSignal', () => {
 
     const claimConflict = new Error('storage version does not match');
     expect(isStorageVersionConflictError(claimConflict)).toBe(true);
-    if (migratedLegacySecret) {
+
+    // Concurrent accept won — keep the shared secret for join retry.
+    expect(
+      shouldDeleteMigratedSecretAfterAcceptConflict(InviteStatus.ACCEPTED)
+    ).toBe(false);
+    expect(
+      shouldDeleteMigratedSecretAfterAcceptConflict(InviteStatus.PENDING)
+    ).toBe(false);
+
+    // Concurrent decline/cancel won — remove the orphan we just migrated.
+    expect(
+      shouldDeleteMigratedSecretAfterAcceptConflict(InviteStatus.DECLINED)
+    ).toBe(true);
+    expect(
+      shouldDeleteMigratedSecretAfterAcceptConflict(undefined)
+    ).toBe(true);
+
+    if (
+      migratedLegacySecret &&
+      shouldDeleteMigratedSecretAfterAcceptConflict(InviteStatus.DECLINED)
+    ) {
       delete secretStore['inv-legacy'];
     }
     expect(secretStore['inv-legacy']).toBeUndefined();
+  });
+
+  it('send rollback preserves concurrently accepted invite rows', () => {
+    expect(canRollbackSendInviteRow(InviteStatus.SENDING)).toBe(true);
+    expect(canRollbackSendInviteRow(InviteStatus.PENDING)).toBe(true);
+    expect(canRollbackSendInviteRow(InviteStatus.ACCEPTED)).toBe(false);
+    expect(canRollbackSendInviteRow(InviteStatus.DECLINED)).toBe(false);
+  });
+
+  it('sender expiry keeps the secret when the receiver already accepted', () => {
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.ACCEPTED)).toBe(false);
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.PENDING)).toBe(true);
+    expect(shouldDeleteSecretAfterSenderExpiry(undefined)).toBe(true);
   });
 
   it('cleanup tombstones sit outside the user-visible history cap', () => {
@@ -1128,5 +1170,36 @@ describe('invite password attachment from matchSignal', () => {
     expect(stored.some((i) => i.inviteId === 'inv-orphan-secret' && isInviteSecretCleanupOnly(i))).toBe(
       true
     );
+  });
+
+  it('cleanup tombstones are never evicted by the history-cap budget', () => {
+    const now = Date.now();
+    const regular: GameInvite[] = Array.from({ length: 3 }, (_, i) => ({
+      inviteId: `inv-reg-${i}`,
+      matchId: 'm1',
+      roomName: 'Room',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: `guest-${i}`,
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: i,
+      expiresAt: now + 60_000,
+    }));
+    const tombstones: GameInvite[] = Array.from({ length: INVITE_HISTORY_CAP + 5 }, (_, i) =>
+      inviteSecretCleanupTombstone({
+        ...regular[0],
+        inviteId: `inv-tomb-${i}`,
+        createdAt: i,
+      })
+    );
+    const stored = invitesForOwnerHistoryStorage([...regular, ...tombstones], 3);
+    expect(stored.filter((i) => !isInviteSecretCleanupOnly(i))).toHaveLength(3);
+    expect(stored.filter((i) => isInviteSecretCleanupOnly(i))).toHaveLength(
+      INVITE_HISTORY_CAP + 5
+    );
+    expect(stored.some((i) => i.inviteId === 'inv-tomb-0')).toBe(true);
   });
 });
