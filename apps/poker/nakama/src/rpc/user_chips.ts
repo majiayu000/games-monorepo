@@ -706,6 +706,8 @@ export function creditCashOut(
  * Atomically credit table chips to the wallet and mark match escrow settled.
  * Prevents double-credit if escrow deletion fails after a successful cash-out:
  * reconciler only refunds `active` escrow, and a settled claim is idempotent.
+ * Missing escrow (already cleared after settle, or orphan-reconciled) must not
+ * fall back to a plain wallet credit — that path mints chips on retry.
  */
 export function creditCashOutWithEscrowSettle(
   nk: nkruntime.Nakama,
@@ -750,12 +752,13 @@ export function creditCashOutWithEscrowSettle(
         };
       }
 
-      // No active escrow record — fall back to a plain wallet credit.
+      // Missing / non-active escrow means a prior settle+clear or orphan reconcile
+      // already returned chips. Do not plain-credit — that mints on post-clear retry.
       if (!escrow || escrow.status !== 'active') {
-        if (credit > 0) {
-          return creditCashOut(nk, userId, credit, logger);
-        }
         const balance = getUserChips(nk, userId, logger).data.balance;
+        logger.info(
+          `Skipping escrowed cash-out for ${userId} in ${matchId}: no active escrow (balance=${balance})`
+        );
         return { balance, previousBalance: balance, change: 0 };
       }
 
@@ -873,6 +876,13 @@ export function settleCashOutsAndEscrowCheckpoint(
           continue;
         }
 
+        // Missing escrow after clearMatchEscrow / orphan reconcile: already
+        // credited once. Do not plain-credit — that mints on post-clear retry.
+        if (!escrow || escrow.status !== 'active') {
+          settledUserIds.push(entry.userId);
+          continue;
+        }
+
         const stored = getUserChips(nk, entry.userId, logger);
         const previousBalance = stored.data.balance;
         const nextWallet: UserChipsData = {
@@ -881,35 +891,14 @@ export function settleCashOutsAndEscrowCheckpoint(
           lastUpdated: now,
         };
 
-        if (escrow && escrow.status === 'active') {
-          const settled: MatchEscrowRecord = {
-            ...escrow,
-            amount: credit,
-            status: 'settled',
-            updatedAt: now,
-          };
-          writes.push(
-            {
-              collection: CHIPS_COLLECTION,
-              key: CHIPS_KEY,
-              userId: entry.userId,
-              value: nextWallet,
-              permissionRead: 1,
-              permissionWrite: 0,
-              version: stored.version,
-            },
-            {
-              collection: ESCROW_COLLECTION,
-              key: escrowKey(matchId),
-              userId: entry.userId,
-              value: settled,
-              permissionRead: 1,
-              permissionWrite: 0,
-              version: escrowObj!.version || '*',
-            }
-          );
-        } else if (credit > 0) {
-          writes.push({
+        const settled: MatchEscrowRecord = {
+          ...escrow,
+          amount: credit,
+          status: 'settled',
+          updatedAt: now,
+        };
+        writes.push(
+          {
             collection: CHIPS_COLLECTION,
             key: CHIPS_KEY,
             userId: entry.userId,
@@ -917,8 +906,17 @@ export function settleCashOutsAndEscrowCheckpoint(
             permissionRead: 1,
             permissionWrite: 0,
             version: stored.version,
-          });
-        }
+          },
+          {
+            collection: ESCROW_COLLECTION,
+            key: escrowKey(matchId),
+            userId: entry.userId,
+            value: settled,
+            permissionRead: 1,
+            permissionWrite: 0,
+            version: escrowObj!.version || '*',
+          }
+        );
 
         settledUserIds.push(entry.userId);
       }

@@ -433,6 +433,67 @@ describe('match escrow', () => {
     expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
   });
 
+  it('does not mint when cash-out is retried after clearMatchEscrow succeeded', () => {
+    // Reproduces 5000→6000 mint: first settle+clear leaves no escrow; retry must not
+    // fall back to plain wallet credit.
+    const nk = createMockNk({ user1: 4000 });
+    writeMatchEscrow(nk, 'match-1', 'user1', 1000, logger);
+
+    const first = creditCashOutWithEscrowSettle(nk, 'match-1', 'user1', 1000, logger);
+    expect(first.change).toBe(1000);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
+
+    const escrowGone = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: 'escrow:match-1', userId: 'user1' },
+    ]);
+    expect(escrowGone).toHaveLength(0);
+
+    const second = creditCashOutWithEscrowSettle(nk, 'match-1', 'user1', 1000, logger);
+    expect(second.change).toBe(0);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
+  });
+
+  it('does not mint when settle retries after clear, or after orphan reconcile', () => {
+    const nk = createMockNk({ user1: 4000 }, { matchesAlive: {} });
+    writeMatchEscrow(nk, 'match-hand', 'user1', 1000, logger);
+
+    const first = settleCashOutsAndEscrowCheckpoint(
+      nk,
+      'match-hand',
+      [{ userId: 'user1', amount: 1000 }],
+      [],
+      logger
+    );
+    expect(first.settledUserIds).toEqual(['user1']);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
+
+    const retry = settleCashOutsAndEscrowCheckpoint(
+      nk,
+      'match-hand',
+      [{ userId: 'user1', amount: 1000 }],
+      [],
+      logger
+    );
+    expect(retry.settledUserIds).toEqual(['user1']);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
+
+    // Orphan reconcile then settle: chips already refunded; settle must not credit again.
+    const nk2 = createMockNk({ user2: 4000 }, { matchesAlive: {} });
+    writeMatchEscrow(nk2, 'dead-match', 'user2', 1000, logger);
+    expect(reconcileOrphanedEscrows(nk2, 'user2', logger)).toBe(1000);
+    expect(getWalletBalance(nk2, 'user2', logger)).toBe(5000);
+
+    const afterReconcile = settleCashOutsAndEscrowCheckpoint(
+      nk2,
+      'dead-match',
+      [{ userId: 'user2', amount: 1000 }],
+      [],
+      logger
+    );
+    expect(afterReconcile.settledUserIds).toEqual(['user2']);
+    expect(getWalletBalance(nk2, 'user2', logger)).toBe(5000);
+  });
+
   it('settles pending cash-outs and remaining escrow in one atomic write', () => {
     const nk = createMockNk({ winner: 4000, loser: 4000 }, { matchesAlive: {} });
     writeMatchEscrow(nk, 'match-hand', 'winner', 1000, logger);
