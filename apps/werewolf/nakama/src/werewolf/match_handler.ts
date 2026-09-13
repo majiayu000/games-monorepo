@@ -546,7 +546,8 @@ function checkAndEnterDeathSkillPhase(
   deadPlayers: { playerId: string; cause: PlayerStatus }[],
   returnPhase: GamePhase,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): boolean {
   // Find players who can use death skill
   const shooters: string[] = [];
@@ -569,7 +570,7 @@ function checkAndEnterDeathSkillPhase(
   state.deathSkillDeaths = [];
 
   // Start with first shooter
-  startNextShooter(state, dispatcher, logger);
+  startNextShooter(state, dispatcher, logger, nk);
 
   return true;
 }
@@ -580,11 +581,12 @@ function checkAndEnterDeathSkillPhase(
 function startNextShooter(
   state: GameState,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   if (state.pendingShooters.length === 0) {
     // No more shooters, return to previous phase flow
-    finishDeathSkillPhase(state, dispatcher, logger);
+    finishDeathSkillPhase(state, dispatcher, logger, nk);
     return;
   }
 
@@ -615,7 +617,8 @@ function processShooterAction(
   state: GameState,
   targetId: string | null,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   const shooter = state.players.get(state.currentShooter!);
   if (!shooter) return;
@@ -683,7 +686,7 @@ function processShooterAction(
   // Move to next shooter or finish
   state.currentShooter = null;
   state.shooterTarget = null;
-  startNextShooter(state, dispatcher, logger);
+  startNextShooter(state, dispatcher, logger, nk);
 }
 
 /**
@@ -692,7 +695,8 @@ function processShooterAction(
 function finishDeathSkillPhase(
   state: GameState,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   const returnPhase = state.previousPhase;
   const deathSkillDeaths = [...state.deathSkillDeaths]; // Copy before clearing
@@ -704,7 +708,7 @@ function finishDeathSkillPhase(
   // Check win condition after death skills
   const winner = checkWinCondition(state);
   if (winner) {
-    endGame(state, winner, dispatcher, logger);
+    endGame(state, winner, dispatcher, logger, nk);
     return;
   }
 
@@ -1179,7 +1183,7 @@ matchLoop = function matchLoop(
     // Check phase timeout
     const now = Date.now();
     if (now >= gameState.phaseEndTime && gameState.phase !== GamePhase.WAITING) {
-      transitionPhase(gameState, dispatcher, logger);
+      transitionPhase(gameState, dispatcher, logger, nk);
     }
 
     // Check win condition (skip during death skill phase - will be checked after)
@@ -1311,13 +1315,13 @@ function processMessage(
       break;
 
     case OpCode.VOTE:
-      handleVote(state, player, data, dispatcher, logger);
+      handleVote(state, player, data, dispatcher, logger, nk);
       break;
 
     case OpCode.USE_SKILL:
       // Handle death skill (shooting) during DEATH_SKILL phase
       if (state.phase === GamePhase.DEATH_SKILL && player.oderId === state.currentShooter) {
-        handleDeathSkill(state, player, data, dispatcher, logger);
+        handleDeathSkill(state, player, data, dispatcher, logger, nk);
       } else {
         handleUseSkill(state, player, data, dispatcher, logger);
       }
@@ -1349,16 +1353,16 @@ function processMessage(
       break;
 
     case OpCode.SHERIFF_TRANSFER_DONE:
-      handleSheriffTransfer(state, player, data, dispatcher, logger);
+      handleSheriffTransfer(state, player, data, dispatcher, logger, nk);
       break;
 
     // 遗言系统消息
     case OpCode.LAST_WORDS_SPEAK:
-      handleLastWordsSpeak(state, player, data, dispatcher, logger);
+      handleLastWordsSpeak(state, player, data, dispatcher, logger, nk);
       break;
 
     case OpCode.LAST_WORDS_SKIP:
-      handleLastWordsSkip(state, player, dispatcher, logger);
+      handleLastWordsSkip(state, player, dispatcher, logger, nk);
       break;
 
     default:
@@ -1374,7 +1378,8 @@ function handleDeathSkill(
   player: Player,
   data: any,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   if (state.phase !== GamePhase.DEATH_SKILL) return;
   if (player.oderId !== state.currentShooter) return;
@@ -1391,7 +1396,7 @@ function handleDeathSkill(
   }
 
   // Process the shooting action
-  processShooterAction(state, targetId || null, dispatcher, logger);
+  processShooterAction(state, targetId || null, dispatcher, logger, nk);
 }
 
 /**
@@ -1432,7 +1437,8 @@ function handleVote(
   player: Player,
   data: any,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   if (state.phase !== GamePhase.DAY_VOTING) return;
   if (player.status !== PlayerStatus.ALIVE) return;
@@ -1486,7 +1492,7 @@ function handleVote(
 
   if (allVoted) {
     // Process votes immediately
-    processVotes(state, dispatcher, logger);
+    processVotes(state, dispatcher, logger, nk);
   }
 }
 
@@ -1842,7 +1848,8 @@ function startGame(
 function transitionPhase(
   state: GameState,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   logger.info(`Transitioning from phase ${state.phase}`);
 
@@ -1896,7 +1903,7 @@ function transitionPhase(
       }
 
       // Process night results (may enter death skill phase)
-      const enteredDeathSkillFromNight = processNightResults(state, dispatcher, logger);
+      const enteredDeathSkillFromNight = processNightResults(state, dispatcher, logger, nk);
 
       // If death skill phase was entered, don't transition to day yet
       if (enteredDeathSkillFromNight) {
@@ -1941,7 +1948,7 @@ function transitionPhase(
           reason: 'timeout',
         });
 
-        finishSheriffTransfer(state, dispatcher, logger);
+        finishSheriffTransfer(state, dispatcher, logger, nk);
       }
       break;
 
@@ -1960,7 +1967,7 @@ function transitionPhase(
 
     case GamePhase.DAY_VOTING:
       // Process votes
-      processVotes(state, dispatcher, logger);
+      processVotes(state, dispatcher, logger, nk);
       break;
 
     case GamePhase.LAST_WORDS:
@@ -1971,7 +1978,7 @@ function transitionPhase(
         logger.info(`Last words timeout: ${speakerPlayer?.displayName || 'unknown'} didn't finish speaking`);
 
         // Finish the last words phase (handles death skill, sheriff transfer, etc.)
-        finishLastWordsPhase(state, dispatcher, logger);
+        finishLastWordsPhase(state, dispatcher, logger, nk);
       }
       break;
 
@@ -1982,7 +1989,7 @@ function transitionPhase(
         logger.info(`Death skill timeout: ${shooter?.displayName} didn't shoot`);
 
         // Process as if they chose not to shoot
-        processShooterAction(state, null, dispatcher, logger);
+        processShooterAction(state, null, dispatcher, logger, nk);
       }
       break;
   }
@@ -1995,7 +2002,8 @@ function transitionPhase(
 function processNightResults(
   state: GameState,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): boolean {
   const deaths: { playerId: string; playerName: string; cause: PlayerStatus }[] = [];
   let savedByWitch = false;
@@ -2076,7 +2084,7 @@ function processNightResults(
     }));
 
     // Return to DAY_DISCUSSION after death skill phase
-    if (checkAndEnterDeathSkillPhase(state, deadPlayersForSkill, GamePhase.DAY_DISCUSSION, dispatcher, logger)) {
+    if (checkAndEnterDeathSkillPhase(state, deadPlayersForSkill, GamePhase.DAY_DISCUSSION, dispatcher, logger, nk)) {
       return true; // Death skill phase entered
     }
 
@@ -2100,7 +2108,8 @@ function processNightResults(
 function processVotes(
   state: GameState,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   // Count votes (sheriff has 1.5 vote weight)
   const voteCount = new Map<string, number>();
@@ -2210,7 +2219,7 @@ function processVotes(
       }];
 
       // Return to NIGHT after death skill phase (after last words would be night)
-      if (checkAndEnterDeathSkillPhase(state, deadPlayersForSkill, GamePhase.NIGHT, dispatcher, logger)) {
+      if (checkAndEnterDeathSkillPhase(state, deadPlayersForSkill, GamePhase.NIGHT, dispatcher, logger, nk)) {
         // Death skill phase entered, skip last words and normal flow
         // Note: Sheriff transfer will happen after death skill phase if sheriff was eliminated
         return;
@@ -2224,7 +2233,7 @@ function processVotes(
     }
 
     // No death skill and no sheriff transfer, go to last words
-    startLastWordsPhase(state, eliminated, PlayerStatus.DEAD_BY_VOTE, dispatcher, logger);
+    startLastWordsPhase(state, eliminated, PlayerStatus.DEAD_BY_VOTE, dispatcher, logger, nk);
   } else {
     // No elimination, go to night
     state.phase = GamePhase.NIGHT;
@@ -2264,7 +2273,7 @@ function endGame(
   winner: Faction,
   dispatcher: nkruntime.MatchDispatcher,
   logger: nkruntime.Logger,
-  nk?: nkruntime.Nakama
+  nk: nkruntime.Nakama
 ): void {
   state.phase = GamePhase.GAME_OVER;
   state.winner = winner;
@@ -2337,54 +2346,52 @@ function endGame(
   });
 
   // Record game results to user statistics and save replay
-  if (nk) {
-    recordGameStats(state, winner, nk, logger);
+  recordGameStats(state, winner, nk, logger);
 
-    // Save game replay
-    try {
-      const replayBuffer = matchReplayBuffers.get(state.matchId);
-      if (replayBuffer) {
-        // Update player states before building replay
-        for (const [playerId, player] of state.players) {
-          if (player.isSpectator) continue;
-          const extState = state.extendedStates.get(playerId);
-          replayBuffer.updatePlayer(playerId, {
-            isAlive: player.status === PlayerStatus.ALIVE,
-            isSheriff: playerId === state.sheriffId,
-            isLover: extState?.isLovers || false,
-            loverId: extState?.loverId
-          });
-        }
-
-        // Record game end event
-        replayBuffer.addEvent({
-          type: GameEventType.GAME_WIN,
-          day: state.dayNumber,
-          phase: state.phase,
-          data: {
-            winner,
-            reason: state.gameEndReason,
-            survivors: alivePlayers.map(p => ({ id: p.oderId, name: p.displayName, role: p.role }))
-          }
+  // Save game replay
+  try {
+    const replayBuffer = matchReplayBuffers.get(state.matchId);
+    if (replayBuffer) {
+      // Update player states before building replay
+      for (const [playerId, player] of state.players) {
+        if (player.isSpectator) continue;
+        const extState = state.extendedStates.get(playerId);
+        replayBuffer.updatePlayer(playerId, {
+          isAlive: player.status === PlayerStatus.ALIVE,
+          isSheriff: playerId === state.sheriffId,
+          isLover: extState?.isLovers || false,
+          loverId: extState?.loverId
         });
-
-        // Build and save replay
-        const winnerFaction = winner === Faction.LOVERS ? 'lovers' : winner;
-        const replay = replayBuffer.build(winnerFaction as Faction | 'lovers');
-        const participantIds = Array.from(state.players.values())
-          .filter(p => !p.isSpectator)
-          .map(p => p.oderId);
-
-        saveReplay(nk, replay, participantIds);
-        logger.info(`Saved replay for match ${state.matchId} with ${replayBuffer.getEventCount()} events`);
       }
-    } catch (e) {
-      logger.error(`Failed to save replay: ${e}`);
-    }
 
-    // Clean up replay buffer
-    cleanupReplayBuffer(state.matchId);
+      // Record game end event
+      replayBuffer.addEvent({
+        type: GameEventType.GAME_WIN,
+        day: state.dayNumber,
+        phase: state.phase,
+        data: {
+          winner,
+          reason: state.gameEndReason,
+          survivors: alivePlayers.map(p => ({ id: p.oderId, name: p.displayName, role: p.role }))
+        }
+      });
+
+      // Build and save replay
+      const winnerFaction = winner === Faction.LOVERS ? 'lovers' : winner;
+      const replay = replayBuffer.build(winnerFaction as Faction | 'lovers');
+      const participantIds = Array.from(state.players.values())
+        .filter(p => !p.isSpectator)
+        .map(p => p.oderId);
+
+      saveReplay(nk, replay, participantIds);
+      logger.info(`Saved replay for match ${state.matchId} with ${replayBuffer.getEventCount()} events`);
+    }
+  } catch (e) {
+    logger.error(`Failed to save replay: ${e}`);
   }
+
+  // Clean up replay buffer
+  cleanupReplayBuffer(state.matchId);
 }
 
 /**
@@ -2550,7 +2557,8 @@ function recordGameStats(
           hunterKilledWolf: false,
           playerFactionSize: 0,
           votedOutWolves: 0,
-          wasExposed: false,
+          // Omit wasExposed until exposure can be derived from GameState —
+          // a hard-coded false incorrectly grants SILENT_KILLER.
         });
       } catch (e) {
         logger.error(`Failed to update achievements for ${player.oderId}: ${e}`);
@@ -2950,7 +2958,8 @@ function handleSheriffTransfer(
   player: Player,
   data: any,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   if (state.phase !== GamePhase.SHERIFF_TRANSFER) return;
   if (player.oderId !== state.sheriffId) return;
@@ -2988,7 +2997,7 @@ function handleSheriffTransfer(
   }
 
   // Continue to the appropriate next phase
-  finishSheriffTransfer(state, dispatcher, logger);
+  finishSheriffTransfer(state, dispatcher, logger, nk);
 }
 
 /**
@@ -2997,7 +3006,8 @@ function handleSheriffTransfer(
 function finishSheriffTransfer(
   state: GameState,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   const returnPhase = state.previousPhase;
   state.previousPhase = null;
@@ -3006,7 +3016,7 @@ function finishSheriffTransfer(
   // Check win condition
   const winner = checkWinCondition(state);
   if (winner) {
-    endGame(state, winner, dispatcher, logger);
+    endGame(state, winner, dispatcher, logger, nk);
     return;
   }
 
@@ -3071,7 +3081,8 @@ function startLastWordsPhase(
   eliminatedPlayerId: string,
   deathCause: PlayerStatus,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   const eliminatedPlayer = state.players.get(eliminatedPlayerId);
   if (!eliminatedPlayer) return;
@@ -3079,7 +3090,7 @@ function startLastWordsPhase(
   // Check if last words are allowed
   if (!state.config.allowLastWords) {
     logger.info(`Last words disabled, skipping for ${eliminatedPlayer.displayName}`);
-    finishLastWordsPhase(state, dispatcher, logger);
+    finishLastWordsPhase(state, dispatcher, logger, nk);
     return;
   }
 
@@ -3133,7 +3144,8 @@ function handleLastWordsSpeak(
   player: Player,
   data: any,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   if (state.phase !== GamePhase.LAST_WORDS) return;
   if (player.oderId !== state.lastWordsSpeaker) return;
@@ -3155,7 +3167,7 @@ function handleLastWordsSpeak(
   });
 
   // End the last words phase after speaking
-  finishLastWordsPhase(state, dispatcher, logger);
+  finishLastWordsPhase(state, dispatcher, logger, nk);
 }
 
 /**
@@ -3165,7 +3177,8 @@ function handleLastWordsSkip(
   state: GameState,
   player: Player,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   if (state.phase !== GamePhase.LAST_WORDS) return;
   if (player.oderId !== state.lastWordsSpeaker) return;
@@ -3180,7 +3193,7 @@ function handleLastWordsSkip(
   });
 
   // End the last words phase
-  finishLastWordsPhase(state, dispatcher, logger);
+  finishLastWordsPhase(state, dispatcher, logger, nk);
 }
 
 /**
@@ -3189,7 +3202,8 @@ function handleLastWordsSkip(
 function finishLastWordsPhase(
   state: GameState,
   dispatcher: nkruntime.MatchDispatcher,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama
 ): void {
   const speaker = state.lastWordsSpeaker;
   const speakerPlayer = speaker ? state.players.get(speaker) : null;
@@ -3215,7 +3229,7 @@ function finishLastWordsPhase(
     }];
 
     // Return to NIGHT after death skill phase
-    if (checkAndEnterDeathSkillPhase(state, deadPlayersForSkill, GamePhase.NIGHT, dispatcher, logger)) {
+    if (checkAndEnterDeathSkillPhase(state, deadPlayersForSkill, GamePhase.NIGHT, dispatcher, logger, nk)) {
       logger.info(`Death skill phase entered after last words`);
       return;
     }
@@ -3230,7 +3244,7 @@ function finishLastWordsPhase(
   // Check win condition
   const winner = checkWinCondition(state);
   if (winner) {
-    endGame(state, winner, dispatcher, logger);
+    endGame(state, winner, dispatcher, logger, nk);
     return;
   }
 

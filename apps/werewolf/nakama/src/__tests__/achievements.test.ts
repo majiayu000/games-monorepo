@@ -162,6 +162,52 @@ describe('applyAchievementUpdates', () => {
     });
     expect(withReveal.newUnlocks.map((u) => u.achievement.id)).toContain(AchievementId.IDIOT_REVEAL);
   });
+  it('skips SILENT_KILLER when wasExposed is omitted; grants only when explicitly false', () => {
+    const nk = createMockNk();
+    const stats = createInitialUserStats('user-wolf');
+    stats.totalGames = 1;
+    stats.wins = 1;
+    stats.werewolfWins = 1;
+    stats.roleStats[Role.WEREWOLF] = { played: 1, wins: 1 };
+
+    const omitted = applyAchievementUpdates(nk, logger, { ...stats }, {
+      userId: 'user-wolf',
+      won: true,
+      role: Role.WEREWOLF,
+      faction: Faction.WEREWOLF,
+      survived: true,
+      wasSheriff: false,
+      isLover: false,
+      loversWon: false,
+    });
+    expect(omitted.newUnlocks.map((u) => u.achievement.id)).not.toContain(AchievementId.SILENT_KILLER);
+
+    const exposed = applyAchievementUpdates(nk, logger, { ...stats }, {
+      userId: 'user-wolf',
+      won: true,
+      role: Role.WEREWOLF,
+      faction: Faction.WEREWOLF,
+      survived: true,
+      wasSheriff: false,
+      isLover: false,
+      loversWon: false,
+      wasExposed: true,
+    });
+    expect(exposed.newUnlocks.map((u) => u.achievement.id)).not.toContain(AchievementId.SILENT_KILLER);
+
+    const silent = applyAchievementUpdates(nk, logger, { ...stats }, {
+      userId: 'user-wolf',
+      won: true,
+      role: Role.WEREWOLF,
+      faction: Faction.WEREWOLF,
+      survived: true,
+      wasSheriff: false,
+      isLover: false,
+      loversWon: false,
+      wasExposed: false,
+    });
+    expect(silent.newUnlocks.map((u) => u.achievement.id)).toContain(AchievementId.SILENT_KILLER);
+  });
 });
 
 describe('update_achievements RPC removal', () => {
@@ -172,5 +218,12 @@ describe('update_achievements RPC removal', () => {
     expect(mainSource).not.toContain("registerRpc('update_achievements'");
     expect(mainSource).not.toContain('rpcUpdateAchievements');
     expect(mainSource).toContain("registerRpc('get_achievements'");
+  });
+
+  it('main.ts no longer registers client-writable record_game_result', async () => {
+    const mainSource = await Bun.file(
+      new URL('../main.ts', import.meta.url)
+    ).text();
+    expect(mainSource).not.toContain("registerRpc('record_game_result'");
   });
 });

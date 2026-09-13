@@ -116,7 +116,7 @@ export function applyAchievementUpdates(
     hunterKilledWolf = false,
     playerFactionSize = 0,
     votedOutWolves = 0,
-    wasExposed = false,
+    wasExposed,
   } = outcome;
 
   logger.info(`Updating achievements for user ${userId}, won: ${won}, role: ${role}`);
@@ -282,7 +282,9 @@ export function applyAchievementUpdates(
     incrementAndCheck(AchievementId.WOLF_EXTERMINATOR);
   }
 
-  if (won && role && isWerewolf(role as Role) && !wasExposed) {
+  // Only grant when exposure is known false. Omit/undefined skips until
+  // match state can derive wasExposed authoritatively.
+  if (won && role && isWerewolf(role as Role) && wasExposed === false) {
     incrementAndCheck(AchievementId.SILENT_KILLER);
   }
 

@@ -68,7 +68,9 @@ function InitModule(
   initializer.registerRpc('find_match', rpcFindMatch);
   initializer.registerRpc('list_matches', rpcListMatches);
   initializer.registerRpc('get_user_stats', rpcGetUserStats);
-  initializer.registerRpc('record_game_result', rpcRecordGameResult);
+  // record_game_result is intentionally not registered: clients must not forge
+  // stats/XP that feed achievement unlocks. Authoritative recording happens in
+  // match endGame via recordGameStats.
   // Friend invite system
   initializer.registerRpc('send_invite', rpcSendInvite);
   initializer.registerRpc('get_invites', rpcGetInvites);
@@ -82,7 +84,7 @@ function InitModule(
   // Replay system
   initializer.registerRpc('get_replays', rpcGetReplays);
   initializer.registerRpc('get_replay', rpcGetReplayById);
-  logger.info('Registered RPC endpoints: create_match, find_match, list_matches, get_user_stats, record_game_result, send_invite, get_invites, respond_invite, cancel_invite, search_users, get_achievements, get_leaderboard, get_replays, get_replay');
+  logger.info('Registered RPC endpoints: create_match, find_match, list_matches, get_user_stats, send_invite, get_invites, respond_invite, cancel_invite, search_users, get_achievements, get_leaderboard, get_replays, get_replay');
 
   // Register matchmaker callback
   initializer.registerMatchmakerMatched(onMatchmakerMatched);
