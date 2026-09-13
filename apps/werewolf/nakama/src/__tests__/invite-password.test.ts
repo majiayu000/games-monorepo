@@ -8,8 +8,13 @@ import {
   buildGetPasswordSignal,
   handleMatchSignalPayload,
   inviteForOwnerStorage,
+  invitesDroppedByHistoryCap,
+  isAtPendingInviteLimit,
+  isInviteVisibleInGetInvites,
+  INVITE_HISTORY_CAP,
   INVITE_SECRET_PERMISSION_READ,
   INVITE_SECRET_PERMISSION_WRITE,
+  legacyInlineInvitePassword,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
   MATCH_SIGNAL_GET_PASSWORD,
@@ -336,5 +341,123 @@ describe('invite password attachment from matchSignal', () => {
     expect(resolved.ok).toBe(false);
     // Status must remain pending so the client can retry after secret is restored
     expect(invite.status).toBe(InviteStatus.PENDING);
+  });
+
+  it('get_invites visibility keeps unexpired accepted invites for join retries', () => {
+    const now = Date.now();
+    const accepted: GameInvite = {
+      inviteId: 'inv-accepted',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.ACCEPTED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+      isPrivate: true,
+    };
+    const declined: GameInvite = { ...accepted, inviteId: 'inv-declined', status: InviteStatus.DECLINED };
+    const expiredAccepted: GameInvite = {
+      ...accepted,
+      inviteId: 'inv-expired',
+      expiresAt: now - 1,
+    };
+
+    expect(isInviteVisibleInGetInvites(accepted, now)).toBe(true);
+    expect(isInviteVisibleInGetInvites({ ...accepted, status: InviteStatus.PENDING }, now)).toBe(true);
+    expect(isInviteVisibleInGetInvites(declined, now)).toBe(false);
+    expect(isInviteVisibleInGetInvites(expiredAccepted, now)).toBe(false);
+  });
+
+  it('legacyInlineInvitePassword captures credentials before owner-storage strip', () => {
+    const legacy: GameInvite = {
+      inviteId: 'inv-legacy',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: Date.now() + 60_000,
+      password: 'legacy-inline',
+    };
+
+    const secretStore: Record<string, { password: string }> = {};
+    const captured = legacyInlineInvitePassword(legacy);
+    expect(captured).toBe('legacy-inline');
+    if (captured) {
+      secretStore[legacy.inviteId] = { password: captured };
+      legacy.isPrivate = true;
+    }
+    const stored = inviteForOwnerStorage(legacy);
+    expect(stored.password).toBeUndefined();
+    expect(stored.isPrivate).toBe(true);
+    expect(secretStore['inv-legacy']).toEqual({ password: 'legacy-inline' });
+    expect(legacyInlineInvitePassword(stored)).toBeUndefined();
+  });
+
+  it('history cap identifies dropped invites so secrets can be deleted', () => {
+    const secretStore: Record<string, { password: string }> = {};
+    const invites: GameInvite[] = [];
+    for (let i = 0; i < INVITE_HISTORY_CAP + 3; i++) {
+      const inviteId = `inv-${i}`;
+      invites.push({
+        inviteId,
+        matchId: 'm1',
+        roomName: 'Private',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: `guest-${i}`,
+        receiverName: 'Guest',
+        status: InviteStatus.DECLINED,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: i,
+        expiresAt: Date.now() + 60_000,
+        isPrivate: true,
+      });
+      secretStore[inviteId] = { password: `pass-${i}` };
+    }
+
+    const dropped = invitesDroppedByHistoryCap(invites);
+    expect(dropped).toHaveLength(3);
+    expect(dropped.map((i) => i.inviteId)).toEqual(['inv-0', 'inv-1', 'inv-2']);
+    for (const invite of dropped) {
+      delete secretStore[invite.inviteId];
+    }
+    expect(secretStore['inv-0']).toBeUndefined();
+    expect(secretStore['inv-2']).toBeUndefined();
+    expect(secretStore[`inv-${INVITE_HISTORY_CAP}`]).toEqual({
+      password: `pass-${INVITE_HISTORY_CAP}`,
+    });
+    expect(invites.slice(-INVITE_HISTORY_CAP)).toHaveLength(INVITE_HISTORY_CAP);
+  });
+
+  it('pending invite limit blocks further sends before secrets accumulate', () => {
+    const now = Date.now();
+    const invites: GameInvite[] = Array.from({ length: INVITE_CONFIG.MAX_PENDING }, (_, i) => ({
+      inviteId: `inv-p-${i}`,
+      matchId: 'm1',
+      roomName: 'Room',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: `guest-${i}`,
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+    }));
+    expect(isAtPendingInviteLimit(invites, now)).toBe(true);
+    expect(isAtPendingInviteLimit(invites.slice(0, -1), now)).toBe(false);
   });
 });

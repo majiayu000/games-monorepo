@@ -5,7 +5,7 @@
  * in server-only storage (never owner-readable invite records) until accept.
  */
 
-import { GameInvite, GameState } from './types';
+import { GameInvite, GameState, InviteStatus, INVITE_CONFIG } from './types';
 
 export const MATCH_SIGNAL_GET_PASSWORD = 'get_password';
 
@@ -14,12 +14,68 @@ export const INVITE_SECRET_PERMISSION_READ = 0;
 /** Nakama storage ACL: no client writes (server RPCs only). */
 export const INVITE_SECRET_PERMISSION_WRITE = 0;
 
+/** Max invites retained in owner-readable history lists. */
+export const INVITE_HISTORY_CAP = 50;
+
 /**
  * Strip password before writing invites to owner-readable storage.
  */
 export function inviteForOwnerStorage(invite: GameInvite): GameInvite {
   const { password: _omit, ...rest } = invite;
   return rest;
+}
+
+/**
+ * Invites the client may list via get_invites: pending, plus unexpired
+ * accepted (so join retries still have an inviteId for respond_invite).
+ */
+export function isInviteVisibleInGetInvites(invite: GameInvite, now: number): boolean {
+  if (invite.expiresAt < now) {
+    return false;
+  }
+  return (
+    invite.status === InviteStatus.PENDING ||
+    invite.status === InviteStatus.ACCEPTED
+  );
+}
+
+/**
+ * Legacy private invites store the password inline. Capture it so callers can
+ * migrate to server-only storage before inviteForOwnerStorage strips it.
+ */
+export function legacyInlineInvitePassword(invite: GameInvite): string | undefined {
+  if (typeof invite.password === 'string' && invite.password.length > 0) {
+    return invite.password;
+  }
+  return undefined;
+}
+
+/**
+ * Invites dropped when a list is capped to the last `limit` entries.
+ * Callers must delete corresponding server-only secrets for these rows.
+ */
+export function invitesDroppedByHistoryCap(
+  invites: GameInvite[],
+  limit: number = INVITE_HISTORY_CAP
+): GameInvite[] {
+  if (invites.length <= limit) {
+    return [];
+  }
+  return invites.slice(0, invites.length - limit);
+}
+
+export function countPendingInvites(invites: GameInvite[], now: number): number {
+  return invites.filter(
+    (invite) => invite.status === InviteStatus.PENDING && invite.expiresAt >= now
+  ).length;
+}
+
+export function isAtPendingInviteLimit(
+  invites: GameInvite[],
+  now: number,
+  maxPending: number = INVITE_CONFIG.MAX_PENDING
+): boolean {
+  return countPendingInvites(invites, now) >= maxPending;
 }
 
 /**

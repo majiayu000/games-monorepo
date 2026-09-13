@@ -30,8 +30,13 @@ import {
 import {
   buildGetPasswordSignal,
   inviteForOwnerStorage,
+  invitesDroppedByHistoryCap,
+  isAtPendingInviteLimit,
+  isInviteVisibleInGetInvites,
+  INVITE_HISTORY_CAP,
   INVITE_SECRET_PERMISSION_READ,
   INVITE_SECRET_PERMISSION_WRITE,
+  legacyInlineInvitePassword,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
 } from './werewolf/invite-password';
@@ -717,6 +722,16 @@ function rpcSendInvite(
     }
     const receiver = receiverUsers[0];
 
+    // Enforce pending cap before creating secrets / invite rows
+    const now = Date.now();
+    const senderInvites = readInvites(nk, ctx.userId, 'sent');
+    if (isAtPendingInviteLimit(senderInvites, now)) {
+      return JSON.stringify({
+        success: false,
+        error: 'Too many pending invites',
+      });
+    }
+
     // Private rooms: password is never in the public label — load via matchSignal
     let invitePassword: string | undefined;
     if (matchLabel.isPrivate) {
@@ -735,7 +750,6 @@ function rpcSendInvite(
     }
 
     // Create invite (password stays out of owner-readable invite storage)
-    const now = Date.now();
     const inviteId = generateInviteId();
     const invite: GameInvite = {
       inviteId,
@@ -758,7 +772,6 @@ function rpcSendInvite(
     }
 
     // Store invite for sender (sent invites)
-    const senderInvites = readInvites(nk, ctx.userId, 'sent');
     senderInvites.push(invite);
     writeInvites(nk, ctx.userId, 'sent', senderInvites);
 
@@ -819,13 +832,16 @@ function rpcGetInvites(
       if (invite.expiresAt < now) {
         // Drop secrets after expiry for any status (incl. accepted held for join retry)
         deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
-        if (invite.status === InviteStatus.PENDING) {
+        if (
+          invite.status === InviteStatus.PENDING ||
+          invite.status === InviteStatus.ACCEPTED
+        ) {
           invite.status = InviteStatus.EXPIRED;
           hasExpired = true;
         }
       }
-      // Only return pending invites by default (password never in owner storage)
-      if (invite.status === InviteStatus.PENDING) {
+      // Pending + unexpired accepted (join-retry discoverability); never include password
+      if (isInviteVisibleInGetInvites(invite, now)) {
         validInvites.push(inviteForOwnerStorage(invite));
       }
     }
@@ -1144,6 +1160,8 @@ function readInvites(
 
 /**
  * Helper: Write invites to storage (never persist passwords — owner-readable ACL).
+ * Migrates legacy inline passwords to server-only secrets before stripping, and
+ * deletes secrets for rows dropped by the history cap.
  */
 function writeInvites(
   nk: nkruntime.Nakama,
@@ -1153,8 +1171,22 @@ function writeInvites(
 ): void {
   const key = type === 'sent' ? INVITE_CONFIG.STORAGE_KEY_SENT : INVITE_CONFIG.STORAGE_KEY_RECEIVED;
 
-  // Clean up old invites (keep last 50); strip passwords so storage API cannot leak them
-  const recentInvites = invites.slice(-50).map(inviteForOwnerStorage);
+  // Rollout: migrate legacy inline passwords before inviteForOwnerStorage strips them
+  for (const invite of invites) {
+    const legacyPassword = legacyInlineInvitePassword(invite);
+    if (legacyPassword) {
+      writeInvitePasswordSecret(nk, invite.inviteId, invite.senderId, legacyPassword);
+      invite.isPrivate = true;
+    }
+  }
+
+  // History cap: drop secrets for evicted rows so they cannot accumulate forever
+  for (const dropped of invitesDroppedByHistoryCap(invites, INVITE_HISTORY_CAP)) {
+    deleteInvitePasswordSecret(nk, dropped.inviteId, dropped.senderId);
+  }
+
+  // Keep last N; strip passwords so storage API cannot leak them
+  const recentInvites = invites.slice(-INVITE_HISTORY_CAP).map(inviteForOwnerStorage);
 
   nk.storageWrite([{
     collection: INVITE_CONFIG.STORAGE_COLLECTION,
