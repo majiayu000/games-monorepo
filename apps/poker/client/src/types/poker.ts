@@ -192,7 +192,8 @@ export interface ServerPlayerJoinedData {
 export interface ServerPlayerLeftData {
   odid: string
   sittingOut: boolean
-  reason?: 'disconnect_timeout'
+  reason?: string
+  walletBalance?: number
 }
 
 export interface ServerPlayerDisconnectedData {

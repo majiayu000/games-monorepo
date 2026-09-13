@@ -29,6 +29,7 @@ import {
   enqueuePendingHandStatistics,
   flushPendingHandStatistics,
   getWalletBalance,
+  normalizeBlind,
   recordHandStatistics,
   settleCashOutsAndEscrowCheckpoint,
   writeMatchEscrowBatch,
@@ -218,14 +219,22 @@ const matchInit: nkruntime.MatchInitFunction<GameState> = function(
     ? parseInt(params.startingChips, 10)
     : DEFAULT_SETTINGS.startingChips;
 
+  // Defense-in-depth: never allow non-positive blinds into wallet-backed play
+  let smallBlind = normalizeBlind(params.smallBlind, DEFAULT_SETTINGS.smallBlind);
+  let bigBlind = normalizeBlind(params.bigBlind, DEFAULT_SETTINGS.bigBlind);
+  if (bigBlind < smallBlind) {
+    smallBlind = DEFAULT_SETTINGS.smallBlind;
+    bigBlind = DEFAULT_SETTINGS.bigBlind;
+  }
+
   const state: GameState = {
     matchId: ctx.matchId || '',
     tickRate: TICK_RATE,
     label: label,
     minPlayers: params.minPlayers ? parseInt(params.minPlayers) : DEFAULT_SETTINGS.minPlayers,
     maxPlayers: params.maxPlayers ? parseInt(params.maxPlayers) : DEFAULT_SETTINGS.maxPlayers,
-    smallBlind: params.smallBlind ? parseInt(params.smallBlind) : DEFAULT_SETTINGS.smallBlind,
-    bigBlind: params.bigBlind ? parseInt(params.bigBlind) : DEFAULT_SETTINGS.bigBlind,
+    smallBlind,
+    bigBlind,
     startingChips: clampStartingChips(rawStarting),
     maxSpectators: params.maxSpectators ? parseInt(params.maxSpectators) : DEFAULT_SETTINGS.maxSpectators,
     phase: GamePhase.Waiting,
@@ -384,9 +393,11 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
       player.isConnected = true;
       player.disconnectedAt = undefined;
 
-      // If player was sitting out due to disconnect and game hasn't started, restore to waiting
+      // If player was sitting out due to disconnect and game hasn't started, restore to waiting.
+      // Clear pendingLeave so a failed cash-out retry cannot remove a successfully rejoined seat.
       if (player.status === PlayerStatus.SittingOut && state.phase === GamePhase.Waiting && player.chips > 0) {
         player.status = PlayerStatus.Waiting;
+        player.pendingLeave = false;
       }
 
       logger.info('Player rejoined', {
@@ -739,8 +750,11 @@ function hasDisconnectedPlayerTimedOut(player: Player, tick: number): boolean {
 
 /**
  * Handle disconnected players who have exceeded grace period.
- * Returns true only when an auto-fold actually succeeded and post-action
- * flow must advance the hand — not for every disconnect settlement.
+ * Returns true only when an auto-fold actually succeeded for the current actor
+ * and post-action flow must advance the hand — not for every disconnect settlement.
+ * Non-current Active expiries are folded in place; when that leaves a single
+ * active player the hand is resolved immediately so a later same-tick expiry
+ * cannot empty getActivePlayers() and stall the betting phase.
  */
 function handleDisconnectedPlayers(
   state: GameState,
@@ -751,75 +765,121 @@ function handleDisconnectedPlayers(
 ): boolean {
   let autoFoldSucceeded = false;
 
-  Object.entries(state.players).forEach(([odid, player]) => {
-    if (hasDisconnectedPlayerTimedOut(player, tick)) {
-      logger.info('Disconnected player grace period expired', { userId: odid });
+  const timedOut = Object.entries(state.players).filter(([, player]) =>
+    hasDisconnectedPlayerTimedOut(player, tick)
+  );
 
-      // If player is in an active hand and is current player, auto-fold (not AllIn)
-      if (player.status === PlayerStatus.Active &&
-          state.currentPlayerSeatIndex === player.seatIndex) {
-        const result = autoFold(state, odid);
-        if (result.success) {
-          broadcastMessage(dispatcher, OpCode.PLAYER_ACTED, {
-            odid: odid,
-            action: PlayerAction.Fold,
-            amount: 0,
-            newChips: player.chips,
-            potTotal: getTotalPot(state),
-            timeout: true,
-            disconnected: true
-          });
+  // Fold non-current actors first so a remaining player can win the hand before
+  // the current actor is also expired in the same tick.
+  timedOut.sort(([odidA, a], [odidB, b]) => {
+    const aCurrent =
+      a.status === PlayerStatus.Active && state.currentPlayerSeatIndex === a.seatIndex ? 1 : 0;
+    const bCurrent =
+      b.status === PlayerStatus.Active && state.currentPlayerSeatIndex === b.seatIndex ? 1 : 0;
+    if (aCurrent !== bCurrent) return aCurrent - bCurrent;
+    return odidA.localeCompare(odidB);
+  });
+
+  for (const [odid, player] of timedOut) {
+    // Seat may have been removed by an earlier mid-loop hand resolution
+    if (!state.players[odid]) {
+      continue;
+    }
+
+    logger.info('Disconnected player grace period expired', { userId: odid });
+
+    const inHand = state.phase !== GamePhase.Waiting;
+    const wasActive = player.status === PlayerStatus.Active;
+    const isCurrentActor =
+      wasActive && state.currentPlayerSeatIndex === player.seatIndex;
+
+    if (wasActive && inHand) {
+      const result = autoFold(state, odid);
+      if (result.success) {
+        broadcastMessage(dispatcher, OpCode.PLAYER_ACTED, {
+          odid: odid,
+          action: PlayerAction.Fold,
+          amount: 0,
+          newChips: player.chips,
+          potTotal: getTotalPot(state),
+          timeout: true,
+          disconnected: true,
+        });
+
+        if (isCurrentActor) {
           autoFoldSucceeded = true;
         }
-      }
 
-      player.disconnectedAt = undefined; // Clear so we don't process again
-      player.pendingLeave = true;
-      // Keep AllIn status so committed chips remain pot-eligible through showdown
-      if (player.status !== PlayerStatus.AllIn) {
-        player.status = PlayerStatus.SittingOut;
+        // Resolve immediately when only one active player remains so a second
+        // same-tick disconnect cannot leave getActivePlayers() empty.
+        if (isOnlyOnePlayerLeft(state)) {
+          handlePostAction(state, dispatcher, logger, tick, nk);
+          autoFoldSucceeded = false; // already resolved; do not advance again
+        }
+      }
+    }
+
+    // Re-read after possible mid-loop settlement/removal
+    const stillSeated = state.players[odid];
+    if (!stillSeated) {
+      continue;
+    }
+
+    stillSeated.disconnectedAt = undefined; // Clear so we don't process again
+    stillSeated.pendingLeave = true;
+
+    // Preserve Folded / AllIn through hand resolution for bookkeeping eligibility.
+    // Only force SittingOut outside an active hand (or for non-fold statuses).
+    if (state.phase === GamePhase.Waiting) {
+      if (stillSeated.status !== PlayerStatus.AllIn) {
+        stillSeated.status = PlayerStatus.SittingOut;
       }
 
       // Waiting (or between hands): settle immediately unless a post-hand escrow
       // checkpoint is still failing — then keep the seat pending so the atomic
       // retry includes this cash-out instead of settling it alone against stale escrow.
-      if (state.phase === GamePhase.Waiting) {
-        if (state.escrowCheckpointFailed) {
-          logger.warn(
-            'Deferring disconnect cash-out until escrow checkpoint retry succeeds',
-            { userId: odid, matchId: state.matchId }
-          );
-          broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
-            odid: odid,
-            sittingOut: true,
-            reason: 'cashout_pending_checkpoint',
-          });
-        } else {
-          const settled = cashOutAndRemovePlayer(state, nk, odid, player.chips, logger);
-          if (settled) {
-            broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
-              odid: odid,
-              sittingOut: false,
-              reason: 'disconnect_timeout',
-              walletBalance: getWalletBalanceSafe(nk, odid, logger),
-            });
-          } else {
-            broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
-              odid: odid,
-              sittingOut: true,
-              reason: 'cashout_pending',
-            });
-          }
-        }
-      } else {
+      if (state.escrowCheckpointFailed) {
+        logger.warn(
+          'Deferring disconnect cash-out until escrow checkpoint retry succeeds',
+          { userId: odid, matchId: state.matchId }
+        );
         broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
           odid: odid,
           sittingOut: true,
-          reason: 'disconnect_timeout_pending_hand'
+          reason: 'cashout_pending_checkpoint',
         });
+      } else {
+        const settled = cashOutAndRemovePlayer(state, nk, odid, stillSeated.chips, logger);
+        if (settled) {
+          broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+            odid: odid,
+            sittingOut: false,
+            reason: 'disconnect_timeout',
+            walletBalance: getWalletBalanceSafe(nk, odid, logger),
+          });
+        } else {
+          broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+            odid: odid,
+            sittingOut: true,
+            reason: 'cashout_pending',
+          });
+        }
       }
+    } else {
+      // In-hand: keep Folded/AllIn; otherwise mark SittingOut for later settlement
+      if (
+        stillSeated.status !== PlayerStatus.AllIn &&
+        stillSeated.status !== PlayerStatus.Folded
+      ) {
+        stillSeated.status = PlayerStatus.SittingOut;
+      }
+      broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+        odid: odid,
+        sittingOut: true,
+        reason: 'disconnect_timeout_pending_hand',
+      });
     }
-  });
+  }
 
   return autoFoldSucceeded;
 }
@@ -1628,13 +1688,15 @@ function handlePostAction(
 
     if (result) {
       if (nk) {
+        // Snapshot contributions before settlePendingLeaves clears totalBetThisHand
+        const foldWinContributions = snapshotHandContributions(state);
         // Persist stacks before announcing the fold-win result so crash recovery
         // cannot erase an already-exposed hand outcome.
         settlePendingLeaves(state, dispatcher, nk, logger, true);
         recordHandBookkeeping(state, nk, logger, [{
           odid: result.winnerId,
           amount: result.amount,
-        }]);
+        }], foldWinContributions);
       }
 
       // Broadcast hand result after durable checkpoint attempt

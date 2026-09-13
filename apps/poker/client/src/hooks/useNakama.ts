@@ -107,6 +107,11 @@ export function useNakama() {
       case OpCode.PLAYER_LEFT: {
         const leftData = data as ServerPlayerLeftData
         console.log('Player left:', leftData.odid, 'sitting out:', leftData.sittingOut)
+        // Departing client may still receive this before leaveMatch completes
+        const { userId, updateChipsBalance } = useGameStore.getState()
+        if (leftData.odid === userId && typeof leftData.walletBalance === 'number') {
+          updateChipsBalance(leftData.walletBalance)
+        }
         // Game state update will be handled by next GAME_STATE message
         break
       }
@@ -604,11 +609,19 @@ export function useNakama() {
       clearHandResult()
       setIsSpectator(false)
       setSpectators([])
+      // Departing presence is not a reliable recipient of PLAYER_LEFT walletBalance;
+      // refresh via get_chips so the lobby shows the settled balance and stats.
+      try {
+        const chips = await getChips()
+        useGameStore.getState().setUserChips(chips)
+      } catch (refreshError) {
+        console.warn('Failed to refresh wallet after leave:', refreshError)
+      }
       console.log('Left match')
     } catch (error) {
       console.error('Failed to leave match:', error)
     }
-  }, [matchId, setMatchId, setConnectionState, setTurnInfo, clearHandResult, setIsSpectator, setSpectators])
+  }, [matchId, setMatchId, setConnectionState, setTurnInfo, clearHandResult, setIsSpectator, setSpectators, getChips])
 
   // Send player action
   const sendAction = useCallback(async (action: PlayerAction) => {

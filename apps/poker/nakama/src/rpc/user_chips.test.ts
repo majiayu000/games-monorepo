@@ -16,6 +16,8 @@ import {
   flushPendingHandStatistics,
   getChipsRpc,
   getWalletBalance,
+  isPositiveBlind,
+  normalizeBlind,
   reconcileOrphanedEscrows,
   recordHandStatistics,
   settleCashOutsAndEscrowCheckpoint,
@@ -51,13 +53,14 @@ function createMockNk(
     matchesAlive?: Record<string, boolean>;
     matchGetThrows?: Record<string, boolean>;
   } = {}
-): nkruntime.Nakama & { __leaderboardCreates: string[] } {
+): nkruntime.Nakama & { __leaderboardCreates: string[]; __leaderboardSortOrders: string[] } {
   const store = new Map<string, StoredObject>();
   let writeCount = 0;
   const failWritesUntil = options.failWritesUntil ?? 0;
   const matchesAlive = options.matchesAlive ?? {};
   const matchGetThrows = options.matchGetThrows ?? {};
   const leaderboardCreates: string[] = [];
+  const leaderboardSortOrders: string[] = [];
 
   for (const [userId, balance] of Object.entries(initialByUser)) {
     store.set(`${userId}:user_data:chips`, {
@@ -79,6 +82,7 @@ function createMockNk(
 
   return {
     __leaderboardCreates: leaderboardCreates,
+    __leaderboardSortOrders: leaderboardSortOrders,
     storageRead: (queries: { collection: string; key: string; userId: string }[]) => {
       return queries
         .map((q) => store.get(`${q.userId}:${q.collection}:${q.key}`))
@@ -178,11 +182,12 @@ function createMockNk(
       }
       return null;
     },
-    leaderboardCreate: (id: string) => {
+    leaderboardCreate: (id: string, _authoritative: boolean, sortOrder: string) => {
       leaderboardCreates.push(id);
+      leaderboardSortOrders.push(sortOrder);
     },
     leaderboardRecordWrite: () => undefined,
-  } as unknown as nkruntime.Nakama & { __leaderboardCreates: string[] };
+  } as unknown as nkruntime.Nakama & { __leaderboardCreates: string[]; __leaderboardSortOrders: string[] };
 }
 
 describe('clampStartingChips', () => {
@@ -194,6 +199,21 @@ describe('clampStartingChips', () => {
 
   it('handles non-finite input', () => {
     expect(clampStartingChips(Number.NaN)).toBe(MIN_BUY_IN);
+  });
+});
+
+describe('normalizeBlind / isPositiveBlind', () => {
+  it('rejects non-positive blinds that would mint via postBlinds', () => {
+    expect(isPositiveBlind(-10)).toBe(false);
+    expect(isPositiveBlind(0)).toBe(false);
+    expect(isPositiveBlind(Number.NaN)).toBe(false);
+    expect(isPositiveBlind(10)).toBe(true);
+  });
+
+  it('falls back when blind is invalid', () => {
+    expect(normalizeBlind(-1000, 10)).toBe(10);
+    expect(normalizeBlind('20', 10)).toBe(20);
+    expect(normalizeBlind(undefined, 10)).toBe(10);
   });
 });
 
@@ -596,11 +616,12 @@ describe('terminate-style atomic cash-outs', () => {
 });
 
 describe('ensurePokerLeaderboard', () => {
-  it('creates poker_total_won on initialization path', () => {
+  it('creates poker_total_won on initialization path with runtime desc sort', () => {
     const nk = createMockNk();
     const logger = createLogger();
     ensurePokerLeaderboard(nk, logger);
     expect(nk.__leaderboardCreates).toContain('poker_total_won');
+    expect(nk.__leaderboardSortOrders).toContain('desc');
   });
 });
 

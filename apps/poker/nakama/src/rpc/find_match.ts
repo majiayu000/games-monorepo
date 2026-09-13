@@ -2,13 +2,48 @@
  * RPC functions for finding and creating poker matches
  */
 
-import { clampStartingChips } from './user_chips';
+import { clampStartingChips, isPositiveBlind, normalizeBlind } from './user_chips';
 
 // Module name must match the registered match handler
 const POKER_MATCH_MODULE = 'poker';
 
 // Server default when client omits startingChips
 const DEFAULT_PRIVATE_STARTING_CHIPS = 1000;
+const DEFAULT_SMALL_BLIND = 10;
+const DEFAULT_BIG_BLIND = 20;
+
+/**
+ * Parse and validate a blinds pair. Rejects non-positive / non-finite values that
+ * would mint chips via postBlinds on wallet-backed tables.
+ */
+function parseBlindsPair(
+  smallRaw: unknown,
+  bigRaw: unknown
+): { ok: true; smallBlind: number; bigBlind: number } | { ok: false; error: string } {
+  if (smallRaw !== undefined && smallRaw !== null && smallRaw !== '' && !isPositiveBlind(
+    typeof smallRaw === 'string' ? Number(smallRaw) : smallRaw
+  )) {
+    return { ok: false, error: 'smallBlind must be a positive integer' };
+  }
+  if (bigRaw !== undefined && bigRaw !== null && bigRaw !== '' && !isPositiveBlind(
+    typeof bigRaw === 'string' ? Number(bigRaw) : bigRaw
+  )) {
+    return { ok: false, error: 'bigBlind must be a positive integer' };
+  }
+
+  const smallBlind = smallRaw === undefined || smallRaw === null || smallRaw === ''
+    ? DEFAULT_SMALL_BLIND
+    : normalizeBlind(smallRaw, DEFAULT_SMALL_BLIND);
+  const bigBlind = bigRaw === undefined || bigRaw === null || bigRaw === ''
+    ? DEFAULT_BIG_BLIND
+    : normalizeBlind(bigRaw, DEFAULT_BIG_BLIND);
+
+  if (bigBlind < smallBlind) {
+    return { ok: false, error: 'bigBlind must be >= smallBlind' };
+  }
+
+  return { ok: true, smallBlind, bigBlind };
+}
 
 interface FindMatchRequest {
   minPlayers?: number;
@@ -104,8 +139,13 @@ export const findMatchRpc: nkruntime.RpcFunction = function(
   }
   if (request.blinds) {
     const [small, big] = request.blinds.split('/');
-    params.smallBlind = small;
-    params.bigBlind = big;
+    const blinds = parseBlindsPair(small, big);
+    if (!blinds.ok) {
+      logger.warn('Rejected find_match with invalid blinds', { blinds: request.blinds, error: blinds.error });
+      throw Error(blinds.error);
+    }
+    params.smallBlind = blinds.smallBlind.toString();
+    params.bigBlind = blinds.bigBlind.toString();
   }
 
   const matchId = nk.matchCreate(POKER_MATCH_MODULE, params);
@@ -241,11 +281,19 @@ export const createPrivateMatchRpc: nkruntime.RpcFunction = function(
   if (request.maxPlayers) {
     params.maxPlayers = request.maxPlayers.toString();
   }
-  if (request.smallBlind) {
-    params.smallBlind = request.smallBlind.toString();
-  }
-  if (request.bigBlind) {
-    params.bigBlind = request.bigBlind.toString();
+  // Never trust client blinds — reject non-positive values that mint via postBlinds
+  if (request.smallBlind !== undefined || request.bigBlind !== undefined) {
+    const blinds = parseBlindsPair(request.smallBlind, request.bigBlind);
+    if (!blinds.ok) {
+      logger.warn('Rejected create_private_match with invalid blinds', {
+        smallBlind: request.smallBlind,
+        bigBlind: request.bigBlind,
+        error: blinds.error,
+      });
+      throw Error(blinds.error);
+    }
+    params.smallBlind = blinds.smallBlind.toString();
+    params.bigBlind = blinds.bigBlind.toString();
   }
 
   // Never trust raw client startingChips — clamp to server bounds

@@ -260,6 +260,32 @@ export function clampStartingChips(value: number): number {
 }
 
 /**
+ * True when a blind is a finite positive integer (wallet-backed tables must reject negatives).
+ */
+export function isPositiveBlind(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value > 0;
+}
+
+/**
+ * Normalize a blind to a positive integer, falling back when the input is invalid.
+ */
+export function normalizeBlind(value: unknown, fallback: number): number {
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return isPositiveBlind(parsed) ? parsed : fallback;
+  }
+  if (isPositiveBlind(value)) {
+    return value;
+  }
+  // Accept finite positive non-integers by flooring (e.g. 10.9 → 10)
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    const floored = Math.floor(value);
+    return floored > 0 ? floored : fallback;
+  }
+  return fallback;
+}
+
+/**
  * Persist durable match escrow so buy-ins can be reconciled after a crash.
  * Uses unconditional writes (last-write-wins) for mid-match amount refreshes.
  */
@@ -1454,7 +1480,8 @@ export function ensurePokerLeaderboard(
     nk.leaderboardCreate(
       POKER_LEADERBOARD_ID,
       true, // authoritative
-      'descending' as unknown as nkruntime.SortOrder,
+      // Nakama TS runtime expects SortOrder.DESCENDING string value "desc", not "descending"
+      'desc' as unknown as nkruntime.SortOrder,
       'set' as unknown as nkruntime.Operator,
       null, // never reset
       undefined // metadata
