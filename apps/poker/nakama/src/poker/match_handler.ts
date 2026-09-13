@@ -27,11 +27,11 @@ import {
   creditCashOutWithEscrowSettle,
   debitBuyInWithEscrow,
   enqueuePendingHandStatistics,
+  enqueuePendingHandStatisticsBatch,
   flushPendingHandStatistics,
   flushPendingLeaderboardUpdates,
   getWalletBalance,
   normalizeBlind,
-  recordHandStatistics,
   settleCashOutsAndEscrowCheckpoint,
   writeMatchEscrowBatch,
 } from '../rpc/user_chips';
@@ -300,7 +300,8 @@ const matchJoinAttempt: nkruntime.MatchJoinAttemptFunction<GameState> = function
       return { state, accept: false, rejectMessage: 'Spectator limit reached' };
     }
     // Retain intent for matchJoin — metadata is not forwarded by Nakama
-    spectatorIntents[`${state.matchId}:${presence.userId}`] = { tick };
+    purgeExpiredSpectatorIntents();
+    spectatorIntents[`${state.matchId}:${presence.userId}`] = { createdAt: Date.now() };
     return { state, accept: true };
   }
 
@@ -329,22 +330,19 @@ const matchJoinAttempt: nkruntime.MatchJoinAttemptFunction<GameState> = function
 };
 
 // Track users who want to join as spectators (used between matchJoinAttempt and matchJoin).
-// Bound to join-attempt tick so abandoned intents expire instead of seating later buy-ins as spectators.
-const SPECTATOR_INTENT_TTL_TICKS = TICK_RATE * 30; // 30 seconds at match tick rate
-const spectatorIntents: { [key: string]: { tick: number } } = {};
+// Wall-clock TTL so abandoned intents expire globally even when no later join runs for that match.
+const SPECTATOR_INTENT_TTL_MS = 30_000;
+const spectatorIntents: { [key: string]: { createdAt: number } } = {};
 
 function spectatorIntentKey(matchId: string, userId: string): string {
   return `${matchId}:${userId}`;
 }
 
-function purgeExpiredSpectatorIntents(matchId: string, tick: number): void {
-  const prefix = `${matchId}:`;
+/** Purge expired spectator intents across all matches (module-global map). */
+function purgeExpiredSpectatorIntents(nowMs: number = Date.now()): void {
   for (const key of Object.keys(spectatorIntents)) {
-    if (!key.startsWith(prefix)) {
-      continue;
-    }
     const intent = spectatorIntents[key];
-    if (!intent || tick - intent.tick > SPECTATOR_INTENT_TTL_TICKS) {
+    if (!intent || nowMs - intent.createdAt > SPECTATOR_INTENT_TTL_MS) {
       delete spectatorIntents[key];
     }
   }
@@ -383,7 +381,7 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
 
   for (const presence of presences) {
     logger.info('User joined', { userId: presence.userId, username: presence.username });
-    purgeExpiredSpectatorIntents(state.matchId, tick);
+    purgeExpiredSpectatorIntents();
 
     // Check if this is a player rejoin
     if (((presence.userId) in state.players)) {
@@ -453,7 +451,7 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
     const intent = spectatorIntents[intentKey];
     if (intent) {
       delete spectatorIntents[intentKey];
-      if (tick - intent.tick > SPECTATOR_INTENT_TTL_TICKS) {
+      if (Date.now() - intent.createdAt > SPECTATOR_INTENT_TTL_MS) {
         logger.warn('Spectator intent expired before matchJoin; rejecting stale join', {
           userId: presence.userId,
           matchId: state.matchId,
@@ -701,28 +699,43 @@ const matchLeave: nkruntime.MatchLeaveFunction<GameState> = function(
         graceSeconds: DISCONNECT_GRACE_SECONDS
       });
     } else {
-      // Game hasn't started - cash out remaining table chips and remove player
-      const settled = cashOutAndRemovePlayer(state, nk, presence.userId, player.chips, logger);
-      if (settled) {
-        logger.info('Player removed (game not started)', { userId: presence.userId });
-        broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
-          odid: presence.userId,
-          sittingOut: false,
-          walletBalance: getWalletBalanceSafe(nk, presence.userId, logger),
-        });
-      } else {
-        // Retain seat/stack until persistence succeeds
-        player.pendingLeave = true;
-        player.status = PlayerStatus.SittingOut;
-        logger.warn('Cash-out failed; retaining table stack pending retry', {
-          userId: presence.userId,
-          chips: player.chips,
-        });
+      // Waiting / between hands: cash out unless a post-hand escrow checkpoint is
+      // still failing — then keep the seat pending so the atomic retry includes
+      // this cash-out instead of settling alone against stale pre-hand escrow.
+      player.pendingLeave = true;
+      player.status = PlayerStatus.SittingOut;
+
+      if (state.escrowCheckpointFailed) {
+        logger.warn(
+          'Deferring Waiting-phase leave cash-out until escrow checkpoint retry succeeds',
+          { userId: presence.userId, matchId: state.matchId, chips: player.chips }
+        );
         broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
           odid: presence.userId,
           sittingOut: true,
-          reason: 'cashout_pending',
+          reason: 'cashout_pending_checkpoint',
         });
+      } else {
+        const settled = cashOutAndRemovePlayer(state, nk, presence.userId, player.chips, logger);
+        if (settled) {
+          logger.info('Player removed (game not started)', { userId: presence.userId });
+          broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+            odid: presence.userId,
+            sittingOut: false,
+            walletBalance: getWalletBalanceSafe(nk, presence.userId, logger),
+          });
+        } else {
+          // Retain seat/stack until persistence succeeds
+          logger.warn('Cash-out failed; retaining table stack pending retry', {
+            userId: presence.userId,
+            chips: player.chips,
+          });
+          broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+            odid: presence.userId,
+            sittingOut: true,
+            reason: 'cashout_pending',
+          });
+        }
       }
     }
   }
@@ -1139,6 +1152,8 @@ function snapshotHandContributions(state: GameState): HandContributionSnapshot[]
 /**
  * Persist career hand stats / leaderboard from authoritative hand results.
  * Prefer a pre-showdown snapshot — executeShowdown clears totalBetThisHand/status.
+ * Journals every participant's pending record before applying any wallet mutation
+ * so a mid-loop crash cannot leave only a subset of the table counted.
  */
 function recordHandBookkeeping(
   state: GameState,
@@ -1157,7 +1172,13 @@ function recordHandBookkeeping(
       status: player.status,
     }));
 
-  participants.forEach((entry) => {
+  const ops: {
+    userId: string;
+    netChange: number;
+    wonHand: boolean;
+  }[] = [];
+
+  for (const entry of participants) {
     const contributed = entry.contributed || 0;
     const wonHand = winnerIds.has(entry.odid);
     const wasInHand =
@@ -1168,45 +1189,61 @@ function recordHandBookkeeping(
       entry.status === PlayerStatus.AllIn;
 
     if (!wasInHand) {
-      return;
+      continue;
     }
 
     const winAmount = winnerAmounts.get(entry.odid) || 0;
-    const netChange = winAmount - contributed;
+    ops.push({
+      userId: entry.odid,
+      netChange: winAmount - contributed,
+      wonHand,
+    });
+  }
+
+  if (ops.length === 0) {
+    return;
+  }
+
+  // Phase 1: durable journal for every participant before any stats apply.
+  try {
+    enqueuePendingHandStatisticsBatch(
+      nk,
+      state.matchId,
+      state.handNumber,
+      ops,
+      logger
+    );
+  } catch (enqueueError) {
+    logger.error('Failed to journal hand statistics batch; retaining in-memory retries', {
+      matchId: state.matchId,
+      handNumber: state.handNumber,
+      error: enqueueError,
+    });
+    if (!state.pendingHandStatRetries) {
+      state.pendingHandStatRetries = [];
+    }
+    for (const op of ops) {
+      state.pendingHandStatRetries.push({
+        userId: op.userId,
+        netChange: op.netChange,
+        wonHand: op.wonHand,
+        handNumber: state.handNumber,
+      });
+    }
+    return;
+  }
+
+  // Phase 2: apply journaled records (OCC claim); pending rows remain if flush fails.
+  for (const op of ops) {
     try {
-      recordHandStatistics(nk, entry.odid, netChange, wonHand, logger);
+      flushPendingHandStatistics(nk, op.userId, logger);
     } catch (e) {
-      logger.warn('Failed to record hand statistics; queueing for retry', {
-        userId: entry.odid,
+      logger.warn('Failed to flush journaled hand statistics; will retry later', {
+        userId: op.userId,
         error: e,
       });
-      try {
-        enqueuePendingHandStatistics(
-          nk,
-          state.matchId,
-          state.handNumber,
-          entry.odid,
-          netChange,
-          wonHand,
-          logger
-        );
-      } catch (enqueueError) {
-        logger.error('Failed to persist pending hand statistics after record failure; retaining in-memory retry', {
-          userId: entry.odid,
-          error: enqueueError,
-        });
-        if (!state.pendingHandStatRetries) {
-          state.pendingHandStatRetries = [];
-        }
-        state.pendingHandStatRetries.push({
-          userId: entry.odid,
-          netChange,
-          wonHand,
-          handNumber: state.handNumber,
-        });
-      }
     }
-  });
+  }
 }
 
 /**
@@ -1312,6 +1349,9 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
     // Only advance the hand when auto-fold actually succeeded for the current actor
     handlePostAction(state, dispatcher, logger, tick, nk);
   }
+
+  // Globally expire abandoned spectator intents (not only when a join runs for that match)
+  purgeExpiredSpectatorIntents();
 
   // Retry cash-outs that previously failed persistence (only pendingLeave seats)
   if (state.phase === GamePhase.Waiting) {
@@ -1892,6 +1932,14 @@ const matchTerminate: nkruntime.MatchTerminateFunction<GameState> = function(
     graceSeconds,
     playerCount: Object.keys(state.players).length
   });
+
+  // Drop any abandoned spectator intents for this match (and globally expired ones)
+  purgeExpiredSpectatorIntents();
+  for (const key of Object.keys(spectatorIntents)) {
+    if (key.startsWith(`${state.matchId}:`)) {
+      delete spectatorIntents[key];
+    }
+  }
 
   // Atomically settle all terminating stacks in one storageWrite so a failed
   // mid-loop cash-out cannot mix post-hand in-memory amounts with stale escrow.

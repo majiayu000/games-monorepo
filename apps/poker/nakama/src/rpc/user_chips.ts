@@ -1029,37 +1029,67 @@ export function enqueuePendingHandStatistics(
   wonHand: boolean,
   logger: nkruntime.Logger
 ): void {
-  if (!matchId || !userId) {
+  enqueuePendingHandStatisticsBatch(
+    nk,
+    matchId,
+    handNumber,
+    [{ userId, netChange, wonHand }],
+    logger
+  );
+}
+
+/**
+ * Journal hand-stat ops for every participant in one storageWrite before any apply.
+ * Crash after this call leaves pending records for later flush; crash before leaves none applied.
+ */
+export function enqueuePendingHandStatisticsBatch(
+  nk: nkruntime.Nakama,
+  matchId: string,
+  handNumber: number,
+  ops: { userId: string; netChange: number; wonHand: boolean }[],
+  logger: nkruntime.Logger
+): void {
+  if (!matchId || ops.length === 0) {
     return;
   }
 
-  const record: PendingHandStatRecord = {
-    matchId,
-    userId,
-    handNumber,
-    netChange,
-    wonHand,
-    createdAt: Date.now(),
-    status: 'pending',
-  };
+  const writes: nkruntime.StorageWriteRequest[] = [];
+  const createdAt = Date.now();
+  for (const op of ops) {
+    if (!op.userId) {
+      continue;
+    }
+    const record: PendingHandStatRecord = {
+      matchId,
+      userId: op.userId,
+      handNumber,
+      netChange: op.netChange,
+      wonHand: op.wonHand,
+      createdAt,
+      status: 'pending',
+    };
+    writes.push({
+      collection: HAND_STATS_PENDING_COLLECTION,
+      key: pendingHandStatKey(matchId, handNumber),
+      userId: op.userId,
+      value: record,
+      permissionRead: 1,
+      permissionWrite: 0,
+    });
+  }
+
+  if (writes.length === 0) {
+    return;
+  }
 
   try {
-    nk.storageWrite([
-      {
-        collection: HAND_STATS_PENDING_COLLECTION,
-        key: pendingHandStatKey(matchId, handNumber),
-        userId,
-        value: record,
-        permissionRead: 1,
-        permissionWrite: 0,
-      },
-    ]);
+    nk.storageWrite(writes);
     logger.warn(
-      `Queued pending hand statistics for ${userId} match ${matchId} hand ${handNumber}`
+      `Queued pending hand statistics batch for match ${matchId} hand ${handNumber} (${writes.length} players)`
     );
   } catch (e) {
     logger.error(
-      `Failed to queue pending hand statistics for ${userId} match ${matchId}: ${e}`
+      `Failed to queue pending hand statistics batch for match ${matchId}: ${e}`
     );
     throw e;
   }
@@ -1186,10 +1216,14 @@ function applyPendingHandStatistic(
         );
       }
 
-      if (!updateLeaderboardScore(nk, userId, next.totalWon, logger)) {
+      if (updateLeaderboardScore(nk, userId, next.totalWon, logger)) {
+        clearStalePendingLeaderboardUpdate(nk, userId, next.totalWon, logger);
+      } else {
         try {
           enqueuePendingLeaderboardUpdate(nk, userId, next.totalWon, logger);
         } catch (enqueueError) {
+          // Stats already claimed/applied — do not rethrow or the hand would be
+          // treated as unapplied and double-counted on a later flush.
           logger.warn(
             `Stats applied but failed to queue leaderboard retry for ${userId}: ${enqueueError}`
           );
@@ -1416,6 +1450,8 @@ export const claimDailyRewardRpc: nkruntime.RpcFunction = (
 
 /**
  * Authoritative hand bookkeeping after a hand resolves (replaces client update_chips).
+ * Leaderboard failures after a committed wallet mutation must not rethrow — callers
+ * would otherwise re-queue the same hand and double-count career stats.
  */
 export function recordHandStatistics(
   nk: nkruntime.Nakama,
@@ -1440,8 +1476,16 @@ export function recordHandStatistics(
     totalWon = chipsData.totalWon;
   });
 
-  if (!updateLeaderboardScore(nk, userId, totalWon, logger)) {
-    enqueuePendingLeaderboardUpdate(nk, userId, totalWon, logger);
+  if (updateLeaderboardScore(nk, userId, totalWon, logger)) {
+    clearStalePendingLeaderboardUpdate(nk, userId, totalWon, logger);
+  } else {
+    try {
+      enqueuePendingLeaderboardUpdate(nk, userId, totalWon, logger);
+    } catch (enqueueError) {
+      logger.error(
+        `Hand stats committed for ${userId} but leaderboard retry enqueue failed: ${enqueueError}`
+      );
+    }
   }
 }
 
@@ -1485,6 +1529,67 @@ export function enqueuePendingLeaderboardUpdate(
       `Failed to queue pending leaderboard update for ${userId}: ${e}`
     );
     throw e;
+  }
+}
+
+/**
+ * After a successful direct leaderboard write, drop any stale pending retry whose
+ * totalWon is not newer than the committed score (preserve concurrent higher retries).
+ */
+export function clearStalePendingLeaderboardUpdate(
+  nk: nkruntime.Nakama,
+  userId: string,
+  committedTotalWon: number,
+  logger: nkruntime.Logger
+): void {
+  if (!userId) {
+    return;
+  }
+
+  let objects: nkruntime.StorageObject[];
+  try {
+    objects = nk.storageRead([
+      {
+        collection: LEADERBOARD_PENDING_COLLECTION,
+        key: LEADERBOARD_PENDING_KEY,
+        userId,
+      },
+    ]);
+  } catch (e) {
+    logger.warn(`Failed to read pending leaderboard for stale clear ${userId}: ${e}`);
+    return;
+  }
+
+  if (objects.length === 0) {
+    return;
+  }
+
+  const pending = objects[0].value as PendingLeaderboardRecord | undefined;
+  if (!pending) {
+    return;
+  }
+
+  // A concurrent newer hand may have queued a higher score — leave it alone.
+  if (
+    pending.status === 'pending' &&
+    typeof pending.totalWon === 'number' &&
+    pending.totalWon > committedTotalWon
+  ) {
+    return;
+  }
+
+  try {
+    nk.storageDelete([
+      {
+        collection: LEADERBOARD_PENDING_COLLECTION,
+        key: LEADERBOARD_PENDING_KEY,
+        userId,
+      },
+    ]);
+  } catch (deleteError) {
+    logger.warn(
+      `Failed to clear stale pending leaderboard for ${userId}: ${deleteError}`
+    );
   }
 }
 

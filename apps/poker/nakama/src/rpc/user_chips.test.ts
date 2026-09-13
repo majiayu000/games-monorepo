@@ -7,11 +7,13 @@ import {
   clampStartingChips,
   claimDailyRewardRpc,
   clearMatchEscrow,
+  clearStalePendingLeaderboardUpdate,
   creditCashOut,
   creditCashOutWithEscrowSettle,
   debitBuyIn,
   debitBuyInWithEscrow,
   enqueuePendingHandStatistics,
+  enqueuePendingHandStatisticsBatch,
   enqueuePendingLeaderboardUpdate,
   ensurePokerLeaderboard,
   flushPendingHandStatistics,
@@ -732,6 +734,96 @@ describe('recordHandStatistics', () => {
       { id: 'poker_total_won', userId: 'user1', score: 200 },
     ]);
     expect(nk.storageList('user1', 'leaderboard_pending').objects).toHaveLength(0);
+  });
+
+  it('does not throw when leaderboard retry enqueue fails after stats commit', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+    nk.__failLeaderboardWrites = true;
+    const originalWrite = nk.storageWrite.bind(nk);
+    nk.storageWrite = ((objects: {
+      collection: string;
+      key: string;
+      userId: string;
+      value: Record<string, unknown>;
+    }[]) => {
+      if (objects.some((o) => o.collection === 'leaderboard_pending')) {
+        throw new Error('leaderboard pending write failed');
+      }
+      return originalWrite(objects);
+    }) as typeof nk.storageWrite;
+
+    // Must not throw — otherwise callers would re-queue and double-count handsPlayed
+    expect(() => recordHandStatistics(nk, 'user1', 200, true, logger)).not.toThrow();
+
+    const chips = (nk.storageRead as Function)([
+      { collection: 'user_data', key: 'chips', userId: 'user1' },
+    ])[0].value;
+    expect(chips.handsPlayed).toBe(1);
+    expect(chips.totalWon).toBe(200);
+    expect(nk.storageList('user1', 'leaderboard_pending').objects).toHaveLength(0);
+  });
+
+  it('clears stale leaderboard_pending after a successful newer direct write', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+
+    enqueuePendingLeaderboardUpdate(nk, 'user1', 100, logger);
+    expect(nk.storageList('user1', 'leaderboard_pending').objects).toHaveLength(1);
+
+    recordHandStatistics(nk, 'user1', 250, true, logger);
+
+    expect(nk.__leaderboardWrites).toEqual([
+      { id: 'poker_total_won', userId: 'user1', score: 250 },
+    ]);
+    expect(nk.storageList('user1', 'leaderboard_pending').objects).toHaveLength(0);
+  });
+
+  it('preserves a newer pending leaderboard retry when clearing after an older write', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+
+    enqueuePendingLeaderboardUpdate(nk, 'user1', 500, logger);
+    clearStalePendingLeaderboardUpdate(nk, 'user1', 200, logger);
+
+    const listed = nk.storageList('user1', 'leaderboard_pending');
+    expect(listed.objects).toHaveLength(1);
+    expect((listed.objects[0].value as { totalWon: number }).totalWon).toBe(500);
+  });
+});
+
+describe('enqueuePendingHandStatisticsBatch', () => {
+  it('journals all participants in one write before any apply', () => {
+    const nk = createMockNk({ a: 5000, b: 5000 });
+    const logger = createLogger();
+
+    enqueuePendingHandStatisticsBatch(
+      nk,
+      'match-batch',
+      4,
+      [
+        { userId: 'a', netChange: 100, wonHand: true },
+        { userId: 'b', netChange: -100, wonHand: false },
+      ],
+      logger
+    );
+
+    expect(nk.storageList('a', 'hand_stats_pending').objects).toHaveLength(1);
+    expect(nk.storageList('b', 'hand_stats_pending').objects).toHaveLength(1);
+
+    expect(flushPendingHandStatistics(nk, 'a', logger)).toBe(1);
+    expect(flushPendingHandStatistics(nk, 'b', logger)).toBe(1);
+
+    const chipsA = (nk.storageRead as Function)([
+      { collection: 'user_data', key: 'chips', userId: 'a' },
+    ])[0].value;
+    const chipsB = (nk.storageRead as Function)([
+      { collection: 'user_data', key: 'chips', userId: 'b' },
+    ])[0].value;
+    expect(chipsA.handsPlayed).toBe(1);
+    expect(chipsA.handsWon).toBe(1);
+    expect(chipsB.handsPlayed).toBe(1);
+    expect(chipsB.totalLost).toBe(100);
   });
 });
 
