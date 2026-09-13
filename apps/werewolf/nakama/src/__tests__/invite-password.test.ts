@@ -11,6 +11,7 @@ import {
   INVITE_SECRET_PERMISSION_READ,
   INVITE_SECRET_PERMISSION_WRITE,
   parsePasswordFromMatchSignal,
+  resolveAcceptInvitePassword,
   MATCH_SIGNAL_GET_PASSWORD,
 } from '../werewolf/invite-password';
 import { GameInvite, InviteStatus, INVITE_CONFIG } from '../werewolf/types';
@@ -150,9 +151,11 @@ describe('invite password attachment from matchSignal', () => {
       maxPlayers: 12,
       createdAt: Date.now(),
       expiresAt: Date.now() + 60_000,
+      isPrivate: true,
       password: invitePassword,
     });
     expect(ownerInvite.password).toBeUndefined();
+    expect(ownerInvite.isPrivate).toBe(true);
 
     // Server-only secret store (simulated) holds the password until accept
     const secretStore: Record<string, { password: string }> = {
@@ -160,14 +163,118 @@ describe('invite password attachment from matchSignal', () => {
     };
 
     // Accept path returns password from server-only store, not from owner storage
-    const acceptPassword = secretStore['inv-e2e']?.password;
-    delete secretStore['inv-e2e'];
-    const acceptPayload = {
-      success: true,
-      matchId: state.matchId,
-      password: acceptPassword,
-    };
-    expect(acceptPayload.password).toBe('invite-secret');
+    const acceptResolved = resolveAcceptInvitePassword(
+      ownerInvite.isPrivate,
+      secretStore['inv-e2e']?.password
+    );
+    expect(acceptResolved.ok).toBe(true);
+    if (acceptResolved.ok) {
+      delete secretStore['inv-e2e'];
+      const acceptPayload = {
+        success: true,
+        matchId: state.matchId,
+        password: acceptResolved.password,
+      };
+      expect(acceptPayload.password).toBe('invite-secret');
+    }
     expect(secretStore['inv-e2e']).toBeUndefined();
+  });
+
+  it('resolveAcceptInvitePassword requires secret for private invites', () => {
+    expect(resolveAcceptInvitePassword(true, undefined)).toEqual({
+      ok: false,
+      error: 'Private room password unavailable',
+    });
+    expect(resolveAcceptInvitePassword(true, '')).toEqual({
+      ok: false,
+      error: 'Private room password unavailable',
+    });
+    expect(resolveAcceptInvitePassword(true, 'room-pass')).toEqual({
+      ok: true,
+      password: 'room-pass',
+    });
+  });
+
+  it('resolveAcceptInvitePassword allows public invites without a secret', () => {
+    expect(resolveAcceptInvitePassword(false, undefined)).toEqual({ ok: true, password: undefined });
+    expect(resolveAcceptInvitePassword(undefined, undefined)).toEqual({
+      ok: true,
+      password: undefined,
+    });
+  });
+
+  it('expire path drops server-only secrets so they do not accumulate', () => {
+    const secretStore: Record<string, { password: string }> = {
+      'inv-expired': { password: 'stale-secret' },
+      'inv-pending': { password: 'live-secret' },
+    };
+    const invites: GameInvite[] = [
+      {
+        inviteId: 'inv-expired',
+        matchId: 'm1',
+        roomName: 'Private',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: 'guest-1',
+        receiverName: 'Guest',
+        status: InviteStatus.PENDING,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: 1,
+        expiresAt: 1, // already expired
+        isPrivate: true,
+      },
+      {
+        inviteId: 'inv-pending',
+        matchId: 'm2',
+        roomName: 'Private',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: 'guest-2',
+        receiverName: 'Guest2',
+        status: InviteStatus.PENDING,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: 1,
+        expiresAt: Date.now() + 60_000,
+        isPrivate: true,
+      },
+    ];
+
+    const now = Date.now();
+    for (const invite of invites) {
+      if (invite.status === InviteStatus.PENDING && invite.expiresAt < now) {
+        invite.status = InviteStatus.EXPIRED;
+        delete secretStore[invite.inviteId];
+      }
+    }
+
+    expect(invites[0].status).toBe(InviteStatus.EXPIRED);
+    expect(secretStore['inv-expired']).toBeUndefined();
+    expect(secretStore['inv-pending']).toEqual({ password: 'live-secret' });
+  });
+
+  it('missing private secret leaves invite pending (retryable)', () => {
+    const invite: GameInvite = {
+      inviteId: 'inv-race',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: Date.now() + 60_000,
+      isPrivate: true,
+    };
+    const secretStore: Record<string, { password: string }> = {}; // concurrent cancel wiped it
+
+    const resolved = resolveAcceptInvitePassword(invite.isPrivate, secretStore[invite.inviteId]?.password);
+    expect(resolved.ok).toBe(false);
+    // Status must remain pending so the client can retry after secret is restored
+    expect(invite.status).toBe(InviteStatus.PENDING);
   });
 });

@@ -22,6 +22,23 @@ export function inviteForOwnerStorage(invite: GameInvite): GameInvite {
   return rest;
 }
 
+/**
+ * Accept path: private invites must resolve a non-empty server-only secret
+ * before the invite may be committed as ACCEPTED.
+ */
+export function resolveAcceptInvitePassword(
+  isPrivate: boolean | undefined,
+  secretPassword: string | undefined
+): { ok: true; password?: string } | { ok: false; error: string } {
+  if (isPrivate) {
+    if (!secretPassword) {
+      return { ok: false, error: 'Private room password unavailable' };
+    }
+    return { ok: true, password: secretPassword };
+  }
+  return { ok: true, password: secretPassword };
+}
+
 export interface GetPasswordSignalRequest {
   action: typeof MATCH_SIGNAL_GET_PASSWORD;
   userId: string;

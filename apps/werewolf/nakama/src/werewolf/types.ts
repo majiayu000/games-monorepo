@@ -925,6 +925,7 @@ export interface GameInvite {
   maxPlayers: number;         // 房间最大人数
   createdAt: number;          // 创建时间戳
   expiresAt: number;          // 过期时间戳
+  isPrivate?: boolean;        // 私密房间：accept 前必须能读到 server-only secret
   password?: string;          // 私密房间密码（仅 accept 时返回；勿写入 owner-readable storage）
 }
 

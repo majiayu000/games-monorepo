@@ -33,6 +33,7 @@ import {
   INVITE_SECRET_PERMISSION_READ,
   INVITE_SECRET_PERMISSION_WRITE,
   parsePasswordFromMatchSignal,
+  resolveAcceptInvitePassword,
 } from './werewolf/invite-password';
 
 // Storage collection for user stats
@@ -752,6 +753,7 @@ function rpcSendInvite(
     };
 
     if (invitePassword) {
+      invite.isPrivate = true;
       writeInvitePasswordSecret(nk, inviteId, ctx.userId, invitePassword);
     }
 
@@ -817,6 +819,8 @@ function rpcGetInvites(
       if (invite.status === InviteStatus.PENDING && invite.expiresAt < now) {
         invite.status = InviteStatus.EXPIRED;
         hasExpired = true;
+        // Expired invites are no longer respondable — drop the server-only secret
+        deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
       }
       // Only return pending invites by default (password never in owner storage)
       if (invite.status === InviteStatus.PENDING) {
@@ -903,6 +907,21 @@ function rpcRespondInvite(
       });
     }
 
+    // Private accept: validate server-only secret BEFORE committing ACCEPTED
+    // so a missing secret leaves the invite pending and retryable.
+    let password: string | undefined;
+    if (accept) {
+      const secretPassword = readInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+      const resolved = resolveAcceptInvitePassword(invite.isPrivate, secretPassword);
+      if (!resolved.ok) {
+        return JSON.stringify({
+          success: false,
+          error: resolved.error,
+        });
+      }
+      password = resolved.password;
+    }
+
     // Update invite status
     const newStatus = accept ? InviteStatus.ACCEPTED : InviteStatus.DECLINED;
     invite.status = newStatus;
@@ -916,10 +935,7 @@ function rpcRespondInvite(
       writeInvites(nk, invite.senderId, 'sent', senderInvites);
     }
 
-    // Password is server-only until accept; always clear the secret after respond
-    const password = accept
-      ? readInvitePasswordSecret(nk, invite.inviteId, invite.senderId)
-      : undefined;
+    // Always clear the secret after a successful respond
     deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
 
     // Notify sender about the response
