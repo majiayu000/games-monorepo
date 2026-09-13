@@ -30,6 +30,7 @@ import {
 import {
   buildGetPasswordSignal,
   inviteForOwnerStorage,
+  inviteMayRetainPasswordSecret,
   invitesDroppedByHistoryCap,
   isAtPendingInviteLimit,
   isInviteVisibleInGetInvites,
@@ -39,6 +40,7 @@ import {
   legacyInlineInvitePassword,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
+  shouldDeleteSecretAfterHistoryCap,
 } from './werewolf/invite-password';
 
 // Storage collection for user stats
@@ -766,32 +768,42 @@ function rpcSendInvite(
       expiresAt: now + INVITE_CONFIG.EXPIRE_TIME,
     };
 
+    let secretWritten = false;
     if (invitePassword) {
       invite.isPrivate = true;
       writeInvitePasswordSecret(nk, inviteId, ctx.userId, invitePassword);
+      secretWritten = true;
     }
 
-    // Store invite for sender (sent invites)
-    senderInvites.push(invite);
-    writeInvites(nk, ctx.userId, 'sent', senderInvites);
+    try {
+      // Store invite for sender (sent invites)
+      senderInvites.push(invite);
+      writeInvites(nk, ctx.userId, 'sent', senderInvites);
 
-    // Store invite for receiver (received invites)
-    const receiverInvites = readInvites(nk, receiverId, 'received');
-    receiverInvites.push(invite);
-    writeInvites(nk, receiverId, 'received', receiverInvites);
+      // Store invite for receiver (received invites)
+      const receiverInvites = readInvites(nk, receiverId, 'received');
+      receiverInvites.push(invite);
+      writeInvites(nk, receiverId, 'received', receiverInvites);
 
-    // Send notification to receiver
-    const notifications: nkruntime.NotificationRequest[] = [{
-      userId: receiverId,
-      subject: 'game_invite',
-      content: {
-        type: 'game_invite',
-        invite,
-      },
-      code: 81, // OpCode.INVITE_RECEIVED
-      persistent: true,
-    }];
-    nk.notificationsSend(notifications);
+      // Send notification to receiver
+      const notifications: nkruntime.NotificationRequest[] = [{
+        userId: receiverId,
+        subject: 'game_invite',
+        content: {
+          type: 'game_invite',
+          invite,
+        },
+        code: 81, // OpCode.INVITE_RECEIVED
+        persistent: true,
+      }];
+      nk.notificationsSend(notifications);
+    } catch (persistError) {
+      // Roll back orphan secret if invite lists / notification fail after write
+      if (secretWritten) {
+        deleteInvitePasswordSecret(nk, inviteId, ctx.userId);
+      }
+      throw persistError;
+    }
 
     logger.info(`User ${ctx.userId} sent invite to ${receiverId} for match ${matchId}`);
 
@@ -830,18 +842,18 @@ function rpcGetInvites(
 
     for (const invite of invites) {
       if (invite.expiresAt < now) {
-        // Drop secrets after expiry for any status (incl. accepted held for join retry)
-        deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+        // Only pending/accepted may still hold a secret; declined/cancelled already cleared
         if (
           invite.status === InviteStatus.PENDING ||
           invite.status === InviteStatus.ACCEPTED
         ) {
+          deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
           invite.status = InviteStatus.EXPIRED;
           hasExpired = true;
         }
       }
-      // Pending + unexpired accepted (join-retry discoverability); never include password
-      if (isInviteVisibleInGetInvites(invite, now)) {
+      // Pending both lists; accepted only on received (join-retry); never include password
+      if (isInviteVisibleInGetInvites(invite, now, type === 'sent' ? 'sent' : 'received')) {
         validInvites.push(inviteForOwnerStorage(invite));
       }
     }
@@ -1093,7 +1105,6 @@ function rpcCancelInvite(
     // Update invite status
     invite.status = InviteStatus.CANCELLED;
     writeInvites(nk, ctx.userId, 'sent', invites);
-    deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
 
     // Update receiver's copy
     const receiverInvites = readInvites(nk, invite.receiverId, 'received');
@@ -1102,6 +1113,9 @@ function rpcCancelInvite(
       receiverInvites[receiverInviteIndex].status = InviteStatus.CANCELLED;
       writeInvites(nk, invite.receiverId, 'received', receiverInvites);
     }
+
+    // Delete after both list rewrites so legacy migration cannot recreate the secret
+    deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
 
     // Notify receiver about cancellation
     const notifications: nkruntime.NotificationRequest[] = [{
@@ -1160,8 +1174,8 @@ function readInvites(
 
 /**
  * Helper: Write invites to storage (never persist passwords — owner-readable ACL).
- * Migrates legacy inline passwords to server-only secrets before stripping, and
- * deletes secrets for rows dropped by the history cap.
+ * Migrates retryable legacy inline passwords to server-only secrets before stripping,
+ * and deletes secrets for history-capped rows only when no retryable counterpart remains.
  */
 function writeInvites(
   nk: nkruntime.Nakama,
@@ -1170,19 +1184,32 @@ function writeInvites(
   invites: GameInvite[]
 ): void {
   const key = type === 'sent' ? INVITE_CONFIG.STORAGE_KEY_SENT : INVITE_CONFIG.STORAGE_KEY_RECEIVED;
+  const now = Date.now();
 
-  // Rollout: migrate legacy inline passwords before inviteForOwnerStorage strips them
+  // Rollout: migrate only unexpired pending/accepted legacy passwords
   for (const invite of invites) {
-    const legacyPassword = legacyInlineInvitePassword(invite);
+    const legacyPassword = legacyInlineInvitePassword(invite, now);
     if (legacyPassword) {
       writeInvitePasswordSecret(nk, invite.inviteId, invite.senderId, legacyPassword);
       invite.isPrivate = true;
     }
   }
 
-  // History cap: drop secrets for evicted rows so they cannot accumulate forever
-  for (const dropped of invitesDroppedByHistoryCap(invites, INVITE_HISTORY_CAP)) {
-    deleteInvitePasswordSecret(nk, dropped.inviteId, dropped.senderId);
+  // History cap: delete secrets only when the counterpart list no longer needs them
+  const dropped = invitesDroppedByHistoryCap(invites, INVITE_HISTORY_CAP);
+  if (dropped.length > 0) {
+    for (const drop of dropped) {
+      if (!inviteMayRetainPasswordSecret(drop, now)) {
+        deleteInvitePasswordSecret(nk, drop.inviteId, drop.senderId);
+        continue;
+      }
+      const counterpartUserId = type === 'sent' ? drop.receiverId : drop.senderId;
+      const counterpartType = type === 'sent' ? 'received' : 'sent';
+      const counterpartInvites = readInvites(nk, counterpartUserId, counterpartType);
+      if (shouldDeleteSecretAfterHistoryCap(drop, counterpartInvites, now)) {
+        deleteInvitePasswordSecret(nk, drop.inviteId, drop.senderId);
+      }
+    }
   }
 
   // Keep last N; strip passwords so storage API cannot leak them

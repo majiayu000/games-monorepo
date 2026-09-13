@@ -26,10 +26,10 @@ export function inviteForOwnerStorage(invite: GameInvite): GameInvite {
 }
 
 /**
- * Invites the client may list via get_invites: pending, plus unexpired
- * accepted (so join retries still have an inviteId for respond_invite).
+ * Invites that may still need their server-only password secret
+ * (pending accept, or accepted join retry before expiry).
  */
-export function isInviteVisibleInGetInvites(invite: GameInvite, now: number): boolean {
+export function inviteMayRetainPasswordSecret(invite: GameInvite, now: number): boolean {
   if (invite.expiresAt < now) {
     return false;
   }
@@ -40,10 +40,40 @@ export function isInviteVisibleInGetInvites(invite: GameInvite, now: number): bo
 }
 
 /**
+ * Invites the client may list via get_invites.
+ * Pending shows in both lists. Unexpired accepted is receiver-only so join
+ * retries keep an inviteId without giving senders a broken Cancel UX.
+ */
+export function isInviteVisibleInGetInvites(
+  invite: GameInvite,
+  now: number,
+  listType: 'sent' | 'received' = 'received'
+): boolean {
+  if (invite.expiresAt < now) {
+    return false;
+  }
+  if (invite.status === InviteStatus.PENDING) {
+    return true;
+  }
+  if (invite.status === InviteStatus.ACCEPTED) {
+    return listType === 'received';
+  }
+  return false;
+}
+
+/**
  * Legacy private invites store the password inline. Capture it so callers can
  * migrate to server-only storage before inviteForOwnerStorage strips it.
+ * Only retryable (unexpired pending/accepted) credentials are migrated —
+ * declined/cancelled/expired must not recreate orphan secrets.
  */
-export function legacyInlineInvitePassword(invite: GameInvite): string | undefined {
+export function legacyInlineInvitePassword(
+  invite: GameInvite,
+  now: number = Date.now()
+): string | undefined {
+  if (!inviteMayRetainPasswordSecret(invite, now)) {
+    return undefined;
+  }
   if (typeof invite.password === 'string' && invite.password.length > 0) {
     return invite.password;
   }
@@ -52,7 +82,7 @@ export function legacyInlineInvitePassword(invite: GameInvite): string | undefin
 
 /**
  * Invites dropped when a list is capped to the last `limit` entries.
- * Callers must delete corresponding server-only secrets for these rows.
+ * Callers should delete secrets only when no retryable counterpart remains.
  */
 export function invitesDroppedByHistoryCap(
   invites: GameInvite[],
@@ -62,6 +92,26 @@ export function invitesDroppedByHistoryCap(
     return [];
   }
   return invites.slice(0, invites.length - limit);
+}
+
+/**
+ * Whether a history-capped row's secret is safe to delete.
+ * If the dropped invite is still retryable, keep the secret unless the
+ * counterpart list also lacks a retryable copy of the same inviteId.
+ */
+export function shouldDeleteSecretAfterHistoryCap(
+  dropped: GameInvite,
+  counterpartInvites: GameInvite[],
+  now: number
+): boolean {
+  if (!inviteMayRetainPasswordSecret(dropped, now)) {
+    return true;
+  }
+  return !counterpartInvites.some(
+    (other) =>
+      other.inviteId === dropped.inviteId &&
+      inviteMayRetainPasswordSecret(other, now)
+  );
 }
 
 export function countPendingInvites(invites: GameInvite[], now: number): number {

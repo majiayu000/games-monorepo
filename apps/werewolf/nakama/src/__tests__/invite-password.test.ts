@@ -8,6 +8,7 @@ import {
   buildGetPasswordSignal,
   handleMatchSignalPayload,
   inviteForOwnerStorage,
+  inviteMayRetainPasswordSecret,
   invitesDroppedByHistoryCap,
   isAtPendingInviteLimit,
   isInviteVisibleInGetInvites,
@@ -17,6 +18,7 @@ import {
   legacyInlineInvitePassword,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
+  shouldDeleteSecretAfterHistoryCap,
   MATCH_SIGNAL_GET_PASSWORD,
 } from '../werewolf/invite-password';
 import { GameInvite, InviteStatus, INVITE_CONFIG } from '../werewolf/types';
@@ -343,7 +345,7 @@ describe('invite password attachment from matchSignal', () => {
     expect(invite.status).toBe(InviteStatus.PENDING);
   });
 
-  it('get_invites visibility keeps unexpired accepted invites for join retries', () => {
+  it('get_invites visibility keeps accepted invites only on received lists', () => {
     const now = Date.now();
     const accepted: GameInvite = {
       inviteId: 'inv-accepted',
@@ -367,14 +369,16 @@ describe('invite password attachment from matchSignal', () => {
       expiresAt: now - 1,
     };
 
-    expect(isInviteVisibleInGetInvites(accepted, now)).toBe(true);
-    expect(isInviteVisibleInGetInvites({ ...accepted, status: InviteStatus.PENDING }, now)).toBe(true);
-    expect(isInviteVisibleInGetInvites(declined, now)).toBe(false);
-    expect(isInviteVisibleInGetInvites(expiredAccepted, now)).toBe(false);
+    expect(isInviteVisibleInGetInvites(accepted, now, 'received')).toBe(true);
+    expect(isInviteVisibleInGetInvites(accepted, now, 'sent')).toBe(false);
+    expect(isInviteVisibleInGetInvites({ ...accepted, status: InviteStatus.PENDING }, now, 'sent')).toBe(true);
+    expect(isInviteVisibleInGetInvites(declined, now, 'received')).toBe(false);
+    expect(isInviteVisibleInGetInvites(expiredAccepted, now, 'received')).toBe(false);
   });
 
-  it('legacyInlineInvitePassword captures credentials before owner-storage strip', () => {
-    const legacy: GameInvite = {
+  it('legacyInlineInvitePassword migrates only retryable credentials', () => {
+    const now = Date.now();
+    const pending: GameInvite = {
       inviteId: 'inv-legacy',
       matchId: 'm1',
       roomName: 'Private',
@@ -386,25 +390,38 @@ describe('invite password attachment from matchSignal', () => {
       currentPlayers: 1,
       maxPlayers: 12,
       createdAt: 1,
-      expiresAt: Date.now() + 60_000,
+      expiresAt: now + 60_000,
       password: 'legacy-inline',
     };
 
     const secretStore: Record<string, { password: string }> = {};
-    const captured = legacyInlineInvitePassword(legacy);
+    const captured = legacyInlineInvitePassword(pending, now);
     expect(captured).toBe('legacy-inline');
     if (captured) {
-      secretStore[legacy.inviteId] = { password: captured };
-      legacy.isPrivate = true;
+      secretStore[pending.inviteId] = { password: captured };
+      pending.isPrivate = true;
     }
-    const stored = inviteForOwnerStorage(legacy);
+    const stored = inviteForOwnerStorage(pending);
     expect(stored.password).toBeUndefined();
     expect(stored.isPrivate).toBe(true);
     expect(secretStore['inv-legacy']).toEqual({ password: 'legacy-inline' });
-    expect(legacyInlineInvitePassword(stored)).toBeUndefined();
+    expect(legacyInlineInvitePassword(stored, now)).toBeUndefined();
+
+    // Declined / cancelled / expired must not recreate secrets
+    expect(
+      legacyInlineInvitePassword({ ...pending, status: InviteStatus.DECLINED, password: 'x' }, now)
+    ).toBeUndefined();
+    expect(
+      legacyInlineInvitePassword({ ...pending, status: InviteStatus.CANCELLED, password: 'x' }, now)
+    ).toBeUndefined();
+    expect(
+      legacyInlineInvitePassword({ ...pending, expiresAt: now - 1, password: 'x' }, now)
+    ).toBeUndefined();
+    expect(inviteMayRetainPasswordSecret({ ...pending, status: InviteStatus.ACCEPTED }, now)).toBe(true);
   });
 
-  it('history cap identifies dropped invites so secrets can be deleted', () => {
+  it('history cap deletes secrets only when no retryable counterpart remains', () => {
+    const now = Date.now();
     const secretStore: Record<string, { password: string }> = {};
     const invites: GameInvite[] = [];
     for (let i = 0; i < INVITE_HISTORY_CAP + 3; i++) {
@@ -421,24 +438,53 @@ describe('invite password attachment from matchSignal', () => {
         currentPlayers: 1,
         maxPlayers: 12,
         createdAt: i,
-        expiresAt: Date.now() + 60_000,
+        expiresAt: now + 60_000,
         isPrivate: true,
       });
       secretStore[inviteId] = { password: `pass-${i}` };
     }
 
-    const dropped = invitesDroppedByHistoryCap(invites);
-    expect(dropped).toHaveLength(3);
-    expect(dropped.map((i) => i.inviteId)).toEqual(['inv-0', 'inv-1', 'inv-2']);
+    // Accepted invite still on receiver list — do not delete when sender caps it out
+    const acceptedDropped: GameInvite = {
+      inviteId: 'inv-keep',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-keep',
+      receiverName: 'Guest',
+      status: InviteStatus.ACCEPTED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: -1,
+      expiresAt: now + 60_000,
+      isPrivate: true,
+    };
+    secretStore['inv-keep'] = { password: 'keep-me' };
+    const senderList = [acceptedDropped, ...invites];
+    const receiverCounterpart: GameInvite[] = [{ ...acceptedDropped }];
+
+    const dropped = invitesDroppedByHistoryCap(senderList);
+    expect(dropped[0].inviteId).toBe('inv-keep');
+    expect(shouldDeleteSecretAfterHistoryCap(dropped[0], receiverCounterpart, now)).toBe(false);
+    expect(shouldDeleteSecretAfterHistoryCap(dropped[0], [], now)).toBe(true);
+
     for (const invite of dropped) {
+      if (shouldDeleteSecretAfterHistoryCap(invite, receiverCounterpart, now)) {
+        delete secretStore[invite.inviteId];
+      }
+    }
+    expect(secretStore['inv-keep']).toEqual({ password: 'keep-me' });
+
+    // Non-retryable dropped rows are always safe to delete
+    for (const invite of invitesDroppedByHistoryCap(invites)) {
+      expect(shouldDeleteSecretAfterHistoryCap(invite, [], now)).toBe(true);
       delete secretStore[invite.inviteId];
     }
     expect(secretStore['inv-0']).toBeUndefined();
-    expect(secretStore['inv-2']).toBeUndefined();
     expect(secretStore[`inv-${INVITE_HISTORY_CAP}`]).toEqual({
       password: `pass-${INVITE_HISTORY_CAP}`,
     });
-    expect(invites.slice(-INVITE_HISTORY_CAP)).toHaveLength(INVITE_HISTORY_CAP);
   });
 
   it('pending invite limit blocks further sends before secrets accumulate', () => {
@@ -459,5 +505,62 @@ describe('invite password attachment from matchSignal', () => {
     }));
     expect(isAtPendingInviteLimit(invites, now)).toBe(true);
     expect(isAtPendingInviteLimit(invites.slice(0, -1), now)).toBe(false);
+  });
+
+  it('expiry cleanup only targets statuses that may retain secrets', () => {
+    const secretStore: Record<string, { password: string }> = {
+      'inv-expired': { password: 'stale-secret' },
+      'inv-declined': { password: 'should-not-touch' },
+    };
+    const invites: GameInvite[] = [
+      {
+        inviteId: 'inv-expired',
+        matchId: 'm1',
+        roomName: 'Private',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: 'guest-1',
+        receiverName: 'Guest',
+        status: InviteStatus.PENDING,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: 1,
+        expiresAt: 1,
+        isPrivate: true,
+      },
+      {
+        inviteId: 'inv-declined',
+        matchId: 'm2',
+        roomName: 'Private',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: 'guest-2',
+        receiverName: 'Guest2',
+        status: InviteStatus.DECLINED,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: 1,
+        expiresAt: 1,
+        isPrivate: true,
+      },
+    ];
+
+    const now = Date.now();
+    for (const invite of invites) {
+      if (invite.expiresAt < now) {
+        if (
+          invite.status === InviteStatus.PENDING ||
+          invite.status === InviteStatus.ACCEPTED
+        ) {
+          delete secretStore[invite.inviteId];
+          invite.status = InviteStatus.EXPIRED;
+        }
+      }
+    }
+
+    expect(invites[0].status).toBe(InviteStatus.EXPIRED);
+    expect(secretStore['inv-expired']).toBeUndefined();
+    expect(invites[1].status).toBe(InviteStatus.DECLINED);
+    expect(secretStore['inv-declined']).toEqual({ password: 'should-not-touch' });
   });
 });
