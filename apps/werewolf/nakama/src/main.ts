@@ -52,7 +52,9 @@ import {
   orphanMigrationCleanupTombstoneSource,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
+  applyDurableLegacyMigrationClaim,
   shouldBlockCancelForAcceptedReceiver,
+  shouldClaimDurableLegacyMigration,
   shouldCompensateStaleLegacyMigration,
   shouldDeleteMigratedSecretAfterAcceptConflict,
   shouldDeleteSecretAfterHistoryCap,
@@ -1869,27 +1871,29 @@ function writeInvites(
   const key = type === 'sent' ? INVITE_CONFIG.STORAGE_KEY_SENT : INVITE_CONFIG.STORAGE_KEY_RECEIVED;
   const now = Date.now();
 
-  // Rollout: migrate only unexpired pending/accepted legacy passwords.
   // Track secrets we newly create so any pre-commit failure can compensate
   // orphans without deleting credentials a concurrent accept still needs.
+  // Migration runs inside the guarded try so a mid-loop secret write failure
+  // still compensates earlier successes.
   const newlyMigratedSecrets: Array<{ inviteId: string; senderId: string }> = [];
-  for (const invite of invites) {
-    const legacyPassword = legacyInlineInvitePassword(invite, now);
-    if (legacyPassword) {
-      const existed = !!readInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
-      writeInvitePasswordSecret(nk, invite.inviteId, invite.senderId, legacyPassword);
-      invite.isPrivate = true;
-      if (!existed) {
-        newlyMigratedSecrets.push({
-          inviteId: invite.inviteId,
-          senderId: invite.senderId,
-        });
-      }
-    }
-  }
-
   let secretsToDeleteAfterCommit: GameInvite[] = [];
   try {
+    // Rollout: migrate only unexpired pending/accepted legacy passwords.
+    for (const invite of invites) {
+      const legacyPassword = legacyInlineInvitePassword(invite, now);
+      if (legacyPassword) {
+        const existed = !!readInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+        writeInvitePasswordSecret(nk, invite.inviteId, invite.senderId, legacyPassword);
+        invite.isPrivate = true;
+        if (!existed) {
+          newlyMigratedSecrets.push({
+            inviteId: invite.inviteId,
+            senderId: invite.senderId,
+          });
+        }
+      }
+    }
+
     // Decide which history-capped secrets may be deleted, but do not delete yet.
     const dropped = invitesDroppedByHistoryCap(invites, INVITE_HISTORY_CAP);
     if (dropped.length > 0) {
@@ -1975,8 +1979,9 @@ function writeInvites(
 }
 
 /**
- * After a stale list rewrite recreates legacy secrets and then loses OCC,
- * delete only those newly created secrets whose durable rows no longer need them.
+ * After a stale list rewrite recreates legacy secrets and then loses the
+ * pre-commit section, either OCC-claim durable migrations (live inline rows)
+ * or delete secrets whose durable rows no longer need them.
  */
 function compensateStaleLegacyMigrations(
   nk: nkruntime.Nakama,
@@ -1986,16 +1991,16 @@ function compensateStaleLegacyMigrations(
   now: number,
   maxReadAttempts: number = 5
 ): void {
-  let durableInvites: GameInvite[] | null = null;
+  let durableRecord: InviteListRecord | null = null;
   for (let attempt = 0; attempt < maxReadAttempts; attempt++) {
     try {
-      durableInvites = readInviteListOrThrow(nk, userId, type).invites;
+      durableRecord = readInviteListOrThrow(nk, userId, type);
       break;
     } catch {
       // Transient read failure — retry before abandoning compensation.
     }
   }
-  if (durableInvites === null) {
+  if (durableRecord === null) {
     // Winning decline/cancel stripped inline password and never persisted our
     // isPrivate marker — get_invites cannot discover these orphans without a
     // cleanup reference. Retain tombstones; merge refuses to clobber live
@@ -2016,7 +2021,19 @@ function compensateStaleLegacyMigrations(
     return;
   }
   for (const { inviteId, senderId } of newlyMigratedSecrets) {
-    const winning = durableInvites.find((invite) => invite.inviteId === inviteId);
+    const winning = durableRecord.invites.find((invite) => invite.inviteId === inviteId);
+    if (shouldClaimDurableLegacyMigration(winning, now)) {
+      // Live row still has the inline password: claim migration via OCC so the
+      // secret stays discoverable and concurrent accept with a stale version
+      // loses OCC and retries instead of committing password-free ACCEPTED.
+      try {
+        claimDurableLegacyMigrationWithRetry(nk, userId, type, inviteId, now);
+      } catch {
+        // Best-effort: leave the secret; durable inline password still works
+        // for accept, and the next successful rewrite migrates again.
+      }
+      continue;
+    }
     if (shouldCompensateStaleLegacyMigration(winning, now)) {
       try {
         deleteInvitePasswordSecret(nk, inviteId, senderId);
@@ -2038,6 +2055,48 @@ function compensateStaleLegacyMigrations(
           void deleteError;
           void tombstoneError;
         }
+      }
+    }
+  }
+}
+
+/**
+ * OCC-claim a durable legacy invite row (strip inline password, set isPrivate)
+ * without deleting the already-created server-only secret. Bumping the list
+ * version serializes against concurrent accept claims.
+ */
+function claimDurableLegacyMigrationWithRetry(
+  nk: nkruntime.Nakama,
+  userId: string,
+  type: 'sent' | 'received',
+  inviteId: string,
+  now: number,
+  maxAttempts: number = 5
+): void {
+  const key = type === 'sent' ? INVITE_CONFIG.STORAGE_KEY_SENT : INVITE_CONFIG.STORAGE_KEY_RECEIVED;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const record = readInviteListOrThrow(nk, userId, type);
+    const claimed = applyDurableLegacyMigrationClaim(record.invites, inviteId, now);
+    if (!claimed) {
+      return;
+    }
+    const recentInvites = invitesForOwnerHistoryStorage(claimed, INVITE_HISTORY_CAP);
+    try {
+      nk.storageWrite([
+        {
+          collection: INVITE_CONFIG.STORAGE_COLLECTION,
+          key,
+          userId,
+          value: { invites: recentInvites },
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: storageWriteVersionFor(record.version),
+        },
+      ]);
+      return;
+    } catch (error) {
+      if (!isStorageVersionConflictError(error)) {
+        throw error;
       }
     }
   }

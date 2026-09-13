@@ -33,7 +33,9 @@ import {
   orphanMigrationCleanupTombstoneSource,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
+  applyDurableLegacyMigrationClaim,
   shouldBlockCancelForAcceptedReceiver,
+  shouldClaimDurableLegacyMigration,
   shouldCompensateStaleLegacyMigration,
   shouldDeleteMigratedSecretAfterAcceptConflict,
   shouldDeleteSecretAfterHistoryCap,
@@ -474,7 +476,7 @@ describe('invite password attachment from matchSignal', () => {
     expect(legacyInlineInvitePassword(legacyPending, now)).toBe('still-inline');
   });
 
-  it('stale-migration compensation rolls back when durable row still has inline password', () => {
+  it('stale-migration compensation claims live inline rows instead of deleting', () => {
     const now = Date.now();
     const durableLegacy: GameInvite = {
       inviteId: 'inv-precommit',
@@ -491,11 +493,20 @@ describe('invite password attachment from matchSignal', () => {
       expiresAt: now + 60_000,
       password: 'legacy-inline',
     };
-    // Pre-commit failure: migration created a secret but list write never stuck.
+    // Pre-commit failure with durable inline password: claim migration, do not
+    // delete — a concurrent accept may already have validated the secret.
     expect(shouldDeleteMigratedSecretAfterAcceptConflict(durableLegacy.status, now, durableLegacy.expiresAt)).toBe(
       false
     );
-    expect(shouldCompensateStaleLegacyMigration(durableLegacy, now)).toBe(true);
+    expect(shouldClaimDurableLegacyMigration(durableLegacy, now)).toBe(true);
+    expect(shouldCompensateStaleLegacyMigration(durableLegacy, now)).toBe(false);
+
+    const claimed = applyDurableLegacyMigrationClaim([durableLegacy], 'inv-precommit', now);
+    expect(claimed).not.toBeNull();
+    expect(claimed![0].isPrivate).toBe(true);
+    expect(claimed![0].password).toBeUndefined();
+    expect(shouldClaimDurableLegacyMigration(claimed![0], now)).toBe(false);
+    expect(shouldCompensateStaleLegacyMigration(claimed![0], now)).toBe(false);
 
     const migratedDurable: GameInvite = {
       ...durableLegacy,
@@ -503,6 +514,7 @@ describe('invite password attachment from matchSignal', () => {
       password: undefined,
     };
     // Successful concurrent migration — keep the secret for join retry.
+    expect(shouldClaimDurableLegacyMigration(migratedDurable, now)).toBe(false);
     expect(shouldCompensateStaleLegacyMigration(migratedDurable, now)).toBe(false);
     expect(
       shouldCompensateStaleLegacyMigration(
@@ -510,6 +522,40 @@ describe('invite password attachment from matchSignal', () => {
         now
       )
     ).toBe(true);
+  });
+
+  it('legacy migration failures remain compensatable when tracked before later throws', () => {
+    // Models writeInvites: each successful secret write is recorded before the
+    // next migration attempt. If a later write throws, earlier IDs stay in the
+    // compensation list because the migration loop sits inside the guarded try.
+    const newlyMigratedSecrets: Array<{ inviteId: string; senderId: string }> = [];
+    const legacyInvites = [
+      { inviteId: 'inv-a', senderId: 'host-1', password: 'a' },
+      { inviteId: 'inv-b', senderId: 'host-1', password: 'b' },
+    ];
+    const secretStore: Record<string, string> = {};
+    let threw = false;
+    try {
+      for (const invite of legacyInvites) {
+        const existed = invite.inviteId in secretStore;
+        if (invite.inviteId === 'inv-b') {
+          throw new Error('mid-loop secret write failure');
+        }
+        secretStore[invite.inviteId] = invite.password;
+        if (!existed) {
+          newlyMigratedSecrets.push({
+            inviteId: invite.inviteId,
+            senderId: invite.senderId,
+          });
+        }
+      }
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    expect(newlyMigratedSecrets).toEqual([{ inviteId: 'inv-a', senderId: 'host-1' }]);
+    expect(secretStore['inv-a']).toBe('a');
+    expect(secretStore['inv-b']).toBeUndefined();
   });
 
   it('history cap deletes secrets only when no retryable counterpart remains', () => {

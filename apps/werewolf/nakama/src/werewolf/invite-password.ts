@@ -309,29 +309,66 @@ export function shouldDeleteMigratedSecretAfterAcceptConflict(
 }
 
 /**
- * Whether a newly created legacy-migration secret should be compensated after a
+ * Whether a pre-commit failure left a durable row that still carries an inline
+ * legacy password. In that case do NOT delete the newly created secret (a
+ * concurrent accept may already have validated it and be about to OCC-commit
+ * ACCEPTED). Instead OCC-claim the migration on the durable list so the secret
+ * stays discoverable and the version advances.
+ */
+export function shouldClaimDurableLegacyMigration(
+  winning: GameInvite | undefined,
+  now: number = Date.now()
+): boolean {
+  return !!(winning && legacyInlineInvitePassword(winning, now));
+}
+
+/**
+ * Apply a durable legacy-migration claim on one invite in an in-memory list:
+ * set isPrivate and strip the inline password. Returns null when the invite is
+ * absent or no longer carries a migratable inline password.
+ */
+export function applyDurableLegacyMigrationClaim(
+  invites: GameInvite[],
+  inviteId: string,
+  now: number = Date.now()
+): GameInvite[] | null {
+  const index = invites.findIndex((invite) => invite.inviteId === inviteId);
+  if (index === -1) {
+    return null;
+  }
+  const current = invites[index];
+  if (!legacyInlineInvitePassword(current, now)) {
+    return null;
+  }
+  const next = invites.slice();
+  next[index] = inviteForOwnerStorage({
+    ...current,
+    isPrivate: true,
+  });
+  return next;
+}
+
+/**
+ * Whether a newly created legacy-migration secret should be deleted after a
  * pre-commit failure (OCC conflict, history-cap read error, or non-version write).
  *
- * Delete when the durable row is terminal/gone, or when it still carries an
- * inline password — that means our isPrivate migration never became durable, so
- * the secret is undiscoverable by later cleanup if the invite expires without a
- * successful rewrite.
+ * Delete only when the durable row is terminal/gone (or past expiry) and no
+ * longer needs the credential. Live rows that still carry an inline password
+ * must be claimed via shouldClaimDurableLegacyMigration instead — deleting
+ * here races with concurrent accept that already validated the secret.
  */
 export function shouldCompensateStaleLegacyMigration(
   winning: GameInvite | undefined,
   now: number = Date.now()
 ): boolean {
-  if (
-    shouldDeleteMigratedSecretAfterAcceptConflict(
-      winning?.status,
-      now,
-      winning?.expiresAt
-    )
-  ) {
-    return true;
+  if (shouldClaimDurableLegacyMigration(winning, now)) {
+    return false;
   }
-  // Pre-commit failure: durable row still has the inline password.
-  return !!(winning && legacyInlineInvitePassword(winning, now));
+  return shouldDeleteMigratedSecretAfterAcceptConflict(
+    winning?.status,
+    now,
+    winning?.expiresAt
+  );
 }
 
 /**
