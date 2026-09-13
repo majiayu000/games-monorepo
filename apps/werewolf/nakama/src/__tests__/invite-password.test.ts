@@ -20,6 +20,7 @@ import {
   INVITE_SECRET_PERMISSION_WRITE,
   legacyInlineInvitePassword,
   markInviteSecretCleanupComplete,
+  applyInviteSecretCleanupMarkers,
   needsTerminalSecretCleanup,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
@@ -791,6 +792,71 @@ describe('invite password attachment from matchSignal', () => {
     markInviteSecretCleanupComplete(invite);
     expect(invite.isPrivate).toBe(false);
     expect(needsTerminalSecretCleanup(invite, now)).toBe(false);
+  });
+
+  it('expired terminal private invites still need secret cleanup', () => {
+    const now = Date.now();
+    const invite: GameInvite = {
+      inviteId: 'inv-expired-term',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.CANCELLED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now - 1,
+      isPrivate: true,
+    };
+    expect(inviteMayRetainPasswordSecret(invite, now)).toBe(false);
+    expect(needsTerminalSecretCleanup(invite, now)).toBe(true);
+  });
+
+  it('cleanup markers merge onto a fresh OCC-read list without touching other rows', () => {
+    const now = Date.now();
+    const concurrent: GameInvite = {
+      inviteId: 'inv-new',
+      matchId: 'm2',
+      roomName: 'Other',
+      senderId: 'host-2',
+      senderName: 'Host2',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 2,
+      expiresAt: now + 60_000,
+      isPrivate: true,
+    };
+    const declined: GameInvite = {
+      inviteId: 'inv-declined',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.DECLINED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+      isPrivate: true,
+    };
+    // Stale in-memory snapshot from before a concurrent send arrived
+    const staleSnapshot = [declined];
+    // Fresh OCC re-read includes the concurrent invite
+    const freshList = [{ ...declined }, { ...concurrent }];
+    expect(applyInviteSecretCleanupMarkers(freshList, ['inv-declined'])).toBe(true);
+    expect(freshList[0].isPrivate).toBe(false);
+    expect(freshList[1].inviteId).toBe('inv-new');
+    expect(freshList[1].isPrivate).toBe(true);
+    // Writing the stale snapshot would have dropped inv-new
+    expect(staleSnapshot).toHaveLength(1);
   });
 
   it('history cap defers secret deletion until after list commit', () => {

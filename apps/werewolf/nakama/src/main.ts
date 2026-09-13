@@ -41,6 +41,7 @@ import {
   INVITE_SECRET_PERMISSION_READ,
   INVITE_SECRET_PERMISSION_WRITE,
   legacyInlineInvitePassword,
+  applyInviteSecretCleanupMarkers,
   markInviteSecretCleanupComplete,
   needsTerminalSecretCleanup,
   parsePasswordFromMatchSignal,
@@ -920,7 +921,10 @@ function rpcGetInvites(
     const data = payload ? JSON.parse(payload) : {};
     const type = data.type || 'received'; // 'sent' or 'received'
 
-    let invites = readInvites(nk, ctx.userId, type);
+    // Versioned read so expiry / cleanup marker writes cannot clobber concurrent
+    // accept/decline/cancel claims via last-writer-wins.
+    const listRecord = readInviteListOrThrow(nk, ctx.userId, type);
+    const invites = listRecord.invites;
 
     // Filter out expired invites and update status
     const now = Date.now();
@@ -928,22 +932,21 @@ function rpcGetInvites(
     let needsWrite = false;
 
     for (const invite of invites) {
-      if (invite.expiresAt < now) {
-        // Only pending/accepted may still hold a secret; declined/cancelled already cleared
-        if (
-          invite.status === InviteStatus.PENDING ||
-          invite.status === InviteStatus.ACCEPTED
-        ) {
-          // Delete before marking expired so transient delete failures stay retryable
-          deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
-          invite.status = InviteStatus.EXPIRED;
-          markInviteSecretCleanupComplete(invite);
-          needsWrite = true;
-        }
+      if (
+        invite.expiresAt < now &&
+        (invite.status === InviteStatus.PENDING ||
+          invite.status === InviteStatus.ACCEPTED)
+      ) {
+        // Delete before marking expired so transient delete failures stay retryable
+        deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+        invite.status = InviteStatus.EXPIRED;
+        markInviteSecretCleanupComplete(invite);
+        needsWrite = true;
       } else if (needsTerminalSecretCleanup(invite, now)) {
-        // Retry orphaned secret deletes for terminal private invites without
-        // failing the whole list on a transient storage error. Mark success
-        // durably so InvitePanel polling does not re-delete every 30s.
+        // Retry orphaned secret deletes for terminal private invites (including
+        // expired declined/cancelled rows) without failing the whole list on a
+        // transient storage error. Mark success durably so InvitePanel polling
+        // does not re-delete every 30s.
         try {
           deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
           markInviteSecretCleanupComplete(invite);
@@ -960,9 +963,22 @@ function rpcGetInvites(
       }
     }
 
-    // Persist expiry / successful cleanup markers
+    // Persist expiry / successful cleanup markers with OCC. On conflict, leave
+    // markers for the next poll rather than overwriting a concurrent claim.
     if (needsWrite) {
-      writeInvites(nk, ctx.userId, type, invites);
+      try {
+        writeInvites(nk, ctx.userId, type, invites, {
+          expectedVersion: listRecord.version,
+        });
+      } catch (writeError) {
+        if (isStorageVersionConflictError(writeError)) {
+          logger.warn(
+            `get_invites OCC conflict while persisting cleanup markers for ${ctx.userId}/${type}; deferring to next poll`
+          );
+        } else {
+          throw writeError;
+        }
+      }
     }
 
     return JSON.stringify({
@@ -1148,15 +1164,15 @@ function rpcRespondInvite(
     if (shouldDeleteSecretAfterTerminalCommit(previousStatus, newStatus)) {
       try {
         deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
-        markInviteSecretCleanupComplete(invite);
-        // Persist cleanup marker on the already-claimed list (best-effort).
-        try {
-          writeInvites(nk, ctx.userId, 'received', invites);
-        } catch (markerError) {
-          logger.warn(
-            `Decline cleanup marker persist failed for ${invite.inviteId}: ${markerError}`
-          );
-        }
+        // Re-read + OCC marker write so concurrent list updates are not clobbered.
+        persistInviteCleanupMarkersBestEffort(
+          nk,
+          logger,
+          ctx.userId,
+          'received',
+          [invite.inviteId],
+          `decline:${invite.inviteId}`
+        );
       } catch (cleanupError) {
         logger.warn(
           `Retryable decline secret cleanup failed for ${invite.inviteId}: ${cleanupError}`
@@ -1314,18 +1330,23 @@ function rpcCancelInvite(
     if (shouldDeleteSecretAfterTerminalCommit(previousStatus, InviteStatus.CANCELLED)) {
       try {
         deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
-        markInviteSecretCleanupComplete(invite);
+        // Re-read + OCC marker writes; on conflict leave markers for get_invites.
+        persistInviteCleanupMarkersBestEffort(
+          nk,
+          logger,
+          ctx.userId,
+          'sent',
+          [invite.inviteId],
+          `cancel-sender:${invite.inviteId}`
+        );
         if (receiverInviteIndex !== -1) {
-          markInviteSecretCleanupComplete(receiverInvites[receiverInviteIndex]);
-        }
-        try {
-          writeInvites(nk, ctx.userId, 'sent', invites);
-          if (receiverInviteIndex !== -1) {
-            writeInvites(nk, invite.receiverId, 'received', receiverInvites);
-          }
-        } catch (markerError) {
-          logger.warn(
-            `Cancel cleanup marker persist failed for ${invite.inviteId}: ${markerError}`
+          persistInviteCleanupMarkersBestEffort(
+            nk,
+            logger,
+            invite.receiverId,
+            'received',
+            [invite.inviteId],
+            `cancel-receiver:${invite.inviteId}`
           );
         }
       } catch (cleanupError) {
@@ -1407,6 +1428,37 @@ function readInviteListOrThrow(
     };
   }
   return { invites: [], version: null };
+}
+
+/**
+ * Best-effort cleanup-marker persist: re-read the list, merge markers for the
+ * given inviteIds, and OCC-write. Conflicts leave markers for get_invites.
+ */
+function persistInviteCleanupMarkersBestEffort(
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger,
+  userId: string,
+  type: 'sent' | 'received',
+  inviteIds: ReadonlyArray<string>,
+  contextLabel: string
+): void {
+  try {
+    const record = readInviteListOrThrow(nk, userId, type);
+    if (!applyInviteSecretCleanupMarkers(record.invites, inviteIds)) {
+      return;
+    }
+    writeInvites(nk, userId, type, record.invites, {
+      expectedVersion: record.version,
+    });
+  } catch (error) {
+    if (isStorageVersionConflictError(error)) {
+      logger.warn(
+        `Cleanup marker OCC conflict for ${contextLabel}; deferring to get_invites`
+      );
+      return;
+    }
+    logger.warn(`Cleanup marker persist failed for ${contextLabel}: ${error}`);
+  }
 }
 
 interface WriteInvitesOptions {

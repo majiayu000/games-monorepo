@@ -168,6 +168,28 @@ export function markInviteSecretCleanupComplete(invite: GameInvite): void {
 }
 
 /**
+ * Apply cleanup markers onto a freshly read invite list (OCC-safe merge).
+ * Returns true when at least one row still needed marking.
+ */
+export function applyInviteSecretCleanupMarkers(
+  invites: GameInvite[],
+  inviteIds: ReadonlyArray<string>
+): boolean {
+  const idSet = new Set(inviteIds);
+  let changed = false;
+  for (const invite of invites) {
+    if (!idSet.has(invite.inviteId)) {
+      continue;
+    }
+    if (invite.isPrivate === true || invite.password !== undefined) {
+      markInviteSecretCleanupComplete(invite);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
  * Whether a storageDelete failure is safe to ignore (object already absent).
  * Transient / unknown errors must be propagated so callers can retry.
  */
