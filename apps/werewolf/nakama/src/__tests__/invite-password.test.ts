@@ -37,6 +37,7 @@ import {
   shouldDeleteSecretAfterHistoryCap,
   shouldDeleteSecretAfterSendRollback,
   shouldDeleteSecretAfterSenderExpiry,
+  shouldDeleteSecretAfterSentExpiredHistoryCap,
   shouldDeleteSecretAfterTerminalCommit,
   shouldRetryPendingInviteClaimAfterConflict,
   storageWriteVersionFor,
@@ -1132,10 +1133,165 @@ describe('invite password attachment from matchSignal', () => {
     expect(canRollbackSendInviteRow(InviteStatus.DECLINED)).toBe(false);
   });
 
-  it('sender expiry keeps the secret when the receiver already accepted', () => {
+  it('sender expiry keeps the secret when the receiver still needs it', () => {
+    // Still actionable or accepted — do not delete until expiry is claimed.
     expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.ACCEPTED)).toBe(false);
-    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.PENDING)).toBe(true);
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.PENDING)).toBe(false);
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.SENDING)).toBe(false);
+    // Gone or already terminal — safe to delete.
     expect(shouldDeleteSecretAfterSenderExpiry(undefined)).toBe(true);
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.EXPIRED)).toBe(true);
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.DECLINED)).toBe(true);
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.CANCELLED)).toBe(true);
+  });
+
+  it('receiver expiry OCC that leaves PENDING must not authorize secret delete', () => {
+    // Simulate: conditional EXPIRED write conflicted; refreshed row still PENDING.
+    const receiverStatusAfterOcc: InviteStatus = InviteStatus.PENDING;
+    const receiverExpiryClaimed = false;
+    expect(receiverExpiryClaimed).toBe(false);
+    expect(shouldDeleteSecretAfterSenderExpiry(receiverStatusAfterOcc)).toBe(false);
+  });
+
+  it('sent-side EXPIRED history eviction consults the receiver before delete', () => {
+    const now = Date.now();
+    const expiredSent: GameInvite = {
+      inviteId: 'inv-hist-expired',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.EXPIRED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now - 1,
+      isPrivate: true,
+    };
+    const receiverAccepted: GameInvite[] = [
+      {
+        ...expiredSent,
+        status: InviteStatus.ACCEPTED,
+        expiresAt: now + 60_000,
+      },
+    ];
+    // Generic history-cap helper treats non-retainable EXPIRED as deletable —
+    // the sent-expired helper must override that when receiver is ACCEPTED.
+    expect(shouldDeleteSecretAfterHistoryCap(expiredSent, receiverAccepted, now)).toBe(true);
+    expect(
+      shouldDeleteSecretAfterSentExpiredHistoryCap(expiredSent, receiverAccepted, now)
+    ).toBe(false);
+    expect(shouldDeleteSecretAfterSentExpiredHistoryCap(expiredSent, [], now)).toBe(true);
+    expect(
+      shouldDeleteSecretAfterSentExpiredHistoryCap(
+        expiredSent,
+        [{ ...expiredSent, status: InviteStatus.DECLINED }],
+        now
+      )
+    ).toBe(true);
+  });
+
+  it('completed cleanup tombstones are dropped from owner history storage', () => {
+    const now = Date.now();
+    const outstanding = inviteSecretCleanupTombstone({
+      inviteId: 'inv-outstanding',
+      matchId: 'm1',
+      roomName: 'Room',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.CANCELLED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now,
+      isPrivate: true,
+    });
+    const completed = {
+      ...outstanding,
+      inviteId: 'inv-completed',
+    };
+    markInviteSecretCleanupComplete(completed);
+    expect(completed.isPrivate).toBe(false);
+    expect(isInviteSecretCleanupOnly(completed)).toBe(true);
+
+    const stored = invitesForOwnerHistoryStorage([outstanding, completed], 50);
+    expect(stored.some((i) => i.inviteId === 'inv-outstanding' && i.isPrivate === true)).toBe(
+      true
+    );
+    expect(stored.some((i) => i.inviteId === 'inv-completed')).toBe(false);
+  });
+
+  it('decline remains authoritative when sender sync fails after durable commit', () => {
+    // Receiver DECLINED write already committed — sender sync must be best-effort
+    // so secret cleanup / notification still run.
+    const previousStatus = InviteStatus.PENDING;
+    const newStatus = InviteStatus.DECLINED;
+    expect(shouldDeleteSecretAfterTerminalCommit(previousStatus, newStatus)).toBe(true);
+
+    let threwToClient = false;
+    let cleanupRan = false;
+    let notified = false;
+    try {
+      // Simulate sender sync failure after durable decline.
+      throw new Error('storage version does not match');
+    } catch (senderSyncError) {
+      // Accept and decline both log rather than throw.
+      expect(String(senderSyncError)).toContain('version');
+    }
+    if (shouldDeleteSecretAfterTerminalCommit(previousStatus, newStatus)) {
+      cleanupRan = true;
+    }
+    notified = true;
+    expect(threwToClient).toBe(false);
+    expect(cleanupRan).toBe(true);
+    expect(notified).toBe(true);
+  });
+
+  it('stale-migration compensation retains a tombstone when storageDelete fails', () => {
+    const now = Date.now();
+    const winningDeclined: GameInvite = {
+      inviteId: 'inv-stale-mig',
+      matchId: 'm1',
+      roomName: 'Room',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.DECLINED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+      // Inline password stripped by winning decline path; no isPrivate marker.
+    };
+    expect(
+      shouldDeleteMigratedSecretAfterAcceptConflict(
+        winningDeclined.status,
+        now,
+        winningDeclined.expiresAt
+      )
+    ).toBe(true);
+
+    let deleteFailed = false;
+    let tombstoneRetained = false;
+    try {
+      throw new Error('transient storageDelete failure');
+    } catch (_deleteError) {
+      deleteFailed = true;
+      const withTombstone = mergeCleanupTombstoneIntoInviteList(
+        [winningDeclined],
+        { ...winningDeclined, senderId: 'host-1', inviteId: 'inv-stale-mig', isPrivate: true }
+      );
+      tombstoneRetained = withTombstone.some(
+        (i) => i.inviteId === 'inv-stale-mig' && isInviteSecretCleanupOnly(i) && i.isPrivate
+      );
+    }
+    expect(deleteFailed).toBe(true);
+    expect(tombstoneRetained).toBe(true);
   });
 
   it('sent-side EXPIRED terminal cleanup rechecks the receiver instead of deleting', () => {

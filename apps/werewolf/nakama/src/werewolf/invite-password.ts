@@ -133,16 +133,19 @@ export function invitesDroppedByHistoryCap(
 }
 
 /**
- * Persist owner-readable history: cap regular rows, keep every outstanding
- * cleanup tombstone outside that budget so unresolved secret deletes are never
- * silently dropped when more than `limit` orphans accumulate.
+ * Persist owner-readable history: cap regular rows, keep every *outstanding*
+ * cleanup tombstone (`isPrivate`) outside that budget so unresolved secret
+ * deletes are never silently dropped. Completed cleanup-only rows (secret
+ * already deleted) are dropped so recovered orphans cannot grow unboundedly.
  */
 export function invitesForOwnerHistoryStorage(
   invites: GameInvite[],
   limit: number = INVITE_HISTORY_CAP
 ): GameInvite[] {
   const regular = invites.filter((invite) => !isInviteSecretCleanupOnly(invite));
-  const cleanup = invites.filter((invite) => isInviteSecretCleanupOnly(invite));
+  const cleanup = invites.filter(
+    (invite) => isInviteSecretCleanupOnly(invite) && invite.isPrivate === true
+  );
   return [...regular.slice(-limit), ...cleanup].map(inviteForOwnerStorage);
 }
 
@@ -164,6 +167,12 @@ export function mergeCleanupTombstoneIntoInviteList(
  * Whether a history-capped row's secret is safe to delete.
  * If the dropped invite is still retryable, keep the secret unless the
  * counterpart list also lacks a retryable copy of the same inviteId.
+ *
+ * Sent-side EXPIRED private rows are special: a prior expiry claim may have
+ * committed while the receiver consult failed, leaving an ACCEPTED receiver
+ * that still needs the password for join retry. Callers must pass the
+ * receiver list (or use {@link shouldDeleteSecretAfterSentExpiredHistoryCap})
+ * rather than treating EXPIRED as unconditionally deletable.
  */
 export function shouldDeleteSecretAfterHistoryCap(
   dropped: GameInvite,
@@ -178,6 +187,26 @@ export function shouldDeleteSecretAfterHistoryCap(
       other.inviteId === dropped.inviteId &&
       inviteMayRetainPasswordSecret(other, now)
   );
+}
+
+/**
+ * Sent-list history eviction of an already-EXPIRED private row must consult
+ * the receiver the same way sender-side expiry does.
+ */
+export function shouldDeleteSecretAfterSentExpiredHistoryCap(
+  dropped: GameInvite,
+  receiverInvites: GameInvite[],
+  now: number
+): boolean {
+  if (
+    dropped.status !== InviteStatus.EXPIRED ||
+    dropped.isPrivate !== true ||
+    !needsTerminalSecretCleanup(dropped, now)
+  ) {
+    return shouldDeleteSecretAfterHistoryCap(dropped, receiverInvites, now);
+  }
+  const receiver = receiverInvites.find((other) => other.inviteId === dropped.inviteId);
+  return shouldDeleteSecretAfterSenderExpiry(receiver?.status);
 }
 
 export function countPendingInvites(invites: GameInvite[], now: number): number {
@@ -235,13 +264,26 @@ export function shouldDeleteMigratedSecretAfterAcceptConflict(
 }
 
 /**
- * Sender-side expiry must not wipe credentials while the receiver already
- * accepted on its independent storage object.
+ * Sender-side expiry must not wipe credentials while the receiver still needs
+ * them: ACCEPTED (join retry) or still-live PENDING/SENDING rows that were not
+ * successfully claimed EXPIRED (OCC left the actionable invite intact).
+ * Safe to delete when the receiver row is gone or already terminal
+ * (DECLINED / CANCELLED / EXPIRED).
  */
 export function shouldDeleteSecretAfterSenderExpiry(
   receiverStatus: InviteStatus | undefined
 ): boolean {
-  return receiverStatus !== InviteStatus.ACCEPTED;
+  if (receiverStatus === undefined) {
+    return true;
+  }
+  if (
+    receiverStatus === InviteStatus.ACCEPTED ||
+    receiverStatus === InviteStatus.PENDING ||
+    receiverStatus === InviteStatus.SENDING
+  ) {
+    return false;
+  }
+  return true;
 }
 
 /**

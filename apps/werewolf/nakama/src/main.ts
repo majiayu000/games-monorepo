@@ -56,6 +56,7 @@ import {
   shouldDeleteSecretAfterHistoryCap,
   shouldDeleteSecretAfterSendRollback,
   shouldDeleteSecretAfterSenderExpiry,
+  shouldDeleteSecretAfterSentExpiredHistoryCap,
   shouldDeleteSecretAfterTerminalCommit,
   shouldRetryPendingInviteClaimAfterConflict,
   storageWriteVersionFor,
@@ -1064,34 +1065,93 @@ function rpcGetInvites(
                   continue;
                 }
                 if (canExpireInviteStatus(receiverStatus)) {
-                  receiverInvite.status = InviteStatus.EXPIRED;
-                  try {
-                    writeInvites(
-                      nk,
-                      expiredInvite.receiverId,
-                      'received',
-                      receiverRecord.invites,
-                      { expectedVersion: receiverRecord.version }
+                  // Retry OCC: an unrelated receiver-list update must not let us
+                  // delete the secret while the invite itself remains PENDING.
+                  let receiverExpiryClaimed = false;
+                  for (let attempt = 0; attempt < 5; attempt++) {
+                    const claimRecord =
+                      attempt === 0
+                        ? receiverRecord
+                        : readInviteListOrThrow(
+                            nk,
+                            expiredInvite.receiverId,
+                            'received'
+                          );
+                    const claimIndex = claimRecord.invites.findIndex(
+                      (i) => i.inviteId === inviteId
                     );
-                  } catch (receiverExpireError) {
-                    if (isStorageVersionConflictError(receiverExpireError)) {
-                      // Re-check: accept may have won between our read and write.
+                    if (claimIndex === -1) {
+                      receiverStatus = undefined;
+                      break;
+                    }
+                    const claimInvite = claimRecord.invites[claimIndex];
+                    receiverStatus = claimInvite.status;
+                    if (receiverStatus === InviteStatus.ACCEPTED) {
+                      break;
+                    }
+                    if (!canExpireInviteStatus(receiverStatus)) {
+                      break;
+                    }
+                    claimInvite.status = InviteStatus.EXPIRED;
+                    try {
+                      writeInvites(
+                        nk,
+                        expiredInvite.receiverId,
+                        'received',
+                        claimRecord.invites,
+                        { expectedVersion: claimRecord.version }
+                      );
+                      receiverStatus = InviteStatus.EXPIRED;
+                      receiverExpiryClaimed = true;
+                      break;
+                    } catch (receiverExpireError) {
+                      if (!isStorageVersionConflictError(receiverExpireError)) {
+                        throw receiverExpireError;
+                      }
+                    }
+                  }
+                  if (
+                    !receiverExpiryClaimed &&
+                    (receiverStatus === InviteStatus.PENDING ||
+                      receiverStatus === InviteStatus.SENDING)
+                  ) {
+                    // Still actionable on the receiver — fail closed.
+                    continue;
+                  }
+                  if (receiverStatus === InviteStatus.ACCEPTED) {
+                    // Accept won during OCC retries — keep secret and sync sender.
+                    expiredInvite.status = InviteStatus.ACCEPTED;
+                    try {
                       const freshReceiver = readInviteListOrThrow(
                         nk,
                         expiredInvite.receiverId,
                         'received'
                       );
-                      const fresh = freshReceiver.invites.find(
+                      const freshAccepted = freshReceiver.invites.find(
                         (i) => i.inviteId === inviteId
                       );
-                      receiverStatus = fresh?.status;
-                      if (!shouldDeleteSecretAfterSenderExpiry(receiverStatus)) {
-                        expiredInvite.status = InviteStatus.ACCEPTED;
-                        continue;
+                      if (freshAccepted?.isPrivate) {
+                        expiredInvite.isPrivate = true;
                       }
-                    } else {
-                      throw receiverExpireError;
+                      const freshSender = readInviteListOrThrow(nk, ctx.userId, 'sent');
+                      const idx = freshSender.invites.findIndex(
+                        (i) => i.inviteId === inviteId
+                      );
+                      if (idx !== -1) {
+                        freshSender.invites[idx].status = InviteStatus.ACCEPTED;
+                        if (freshAccepted?.isPrivate) {
+                          freshSender.invites[idx].isPrivate = true;
+                        }
+                        writeInvites(nk, ctx.userId, 'sent', freshSender.invites, {
+                          expectedVersion: freshSender.version,
+                        });
+                      }
+                    } catch (syncError) {
+                      logger.warn(
+                        `Sender expiry sync to ACCEPTED failed for ${inviteId}: ${syncError}`
+                      );
                     }
+                    continue;
                   }
                 }
               }
@@ -1104,6 +1164,9 @@ function rpcGetInvites(
               continue;
             }
             if (!shouldDeleteSecretAfterSenderExpiry(receiverStatus)) {
+              if (receiverStatus === InviteStatus.ACCEPTED) {
+                expiredInvite.status = InviteStatus.ACCEPTED;
+              }
               continue;
             }
           }
@@ -1388,13 +1451,12 @@ function rpcRespondInvite(
         });
       }
     } catch (senderSyncError) {
-      if (accept) {
-        logger.warn(
-          `Receiver accepted ${inviteId} but sender copy sync failed: ${senderSyncError}`
-        );
-      } else {
-        throw senderSyncError;
-      }
+      // Receiver commit is authoritative for both accept and decline. Throwing
+      // after a durable DECLINED write would strand the sender on PENDING,
+      // skip secret cleanup / notification, and block receiver retries.
+      logger.warn(
+        `Receiver ${accept ? 'accepted' : 'declined'} ${inviteId} but sender copy sync failed: ${senderSyncError}`
+      );
     }
 
     if (shouldDeleteSecretAfterTerminalCommit(previousStatus, newStatus)) {
@@ -1744,14 +1806,35 @@ function writeInvites(
   const secretsToDeleteAfterCommit: GameInvite[] = [];
   if (dropped.length > 0) {
     for (const drop of dropped) {
+      const counterpartUserId = type === 'sent' ? drop.receiverId : drop.senderId;
+      const counterpartType = type === 'sent' ? 'received' : 'sent';
+      // Sent-side EXPIRED private rows need receiver coordination even though
+      // inviteMayRetainPasswordSecret is already false (expiry elapsed).
+      if (
+        type === 'sent' &&
+        drop.status === InviteStatus.EXPIRED &&
+        drop.isPrivate === true
+      ) {
+        const receiverInvites = readInviteListOrThrow(
+          nk,
+          counterpartUserId,
+          counterpartType
+        ).invites;
+        if (shouldDeleteSecretAfterSentExpiredHistoryCap(drop, receiverInvites, now)) {
+          secretsToDeleteAfterCommit.push(drop);
+        }
+        continue;
+      }
       if (!inviteMayRetainPasswordSecret(drop, now)) {
         secretsToDeleteAfterCommit.push(drop);
         continue;
       }
-      const counterpartUserId = type === 'sent' ? drop.receiverId : drop.senderId;
-      const counterpartType = type === 'sent' ? 'received' : 'sent';
       // Strict read: transient failure must not look like "counterpart gone".
-      const counterpartInvites = readInviteListOrThrow(nk, counterpartUserId, counterpartType).invites;
+      const counterpartInvites = readInviteListOrThrow(
+        nk,
+        counterpartUserId,
+        counterpartType
+      ).invites;
       if (shouldDeleteSecretAfterHistoryCap(drop, counterpartInvites, now)) {
         secretsToDeleteAfterCommit.push(drop);
       }
@@ -1835,8 +1918,36 @@ function compensateStaleLegacyMigrations(
     ) {
       try {
         deleteInvitePasswordSecret(nk, inviteId, senderId);
-      } catch {
-        // Best-effort compensation; durable terminal rows may still lack markers.
+      } catch (deleteError) {
+        // Winning decline/cancel often stripped isPrivate — without a tombstone
+        // get_invites cannot rediscover this orphaned secret. Retain one.
+        try {
+          const tombstoneSource: GameInvite = winning ?? {
+            inviteId,
+            matchId: '',
+            roomName: '',
+            senderId,
+            senderName: '',
+            receiverId: userId,
+            receiverName: '',
+            status: InviteStatus.CANCELLED,
+            currentPlayers: 0,
+            maxPlayers: 0,
+            createdAt: now,
+            expiresAt: now,
+            isPrivate: true,
+          };
+          retainInviteSecretCleanupTombstone(nk, userId, type, {
+            ...tombstoneSource,
+            senderId,
+            inviteId,
+            isPrivate: true,
+          });
+        } catch (tombstoneError) {
+          // Compensation is best-effort; surface both failures in logs only.
+          void deleteError;
+          void tombstoneError;
+        }
       }
     }
   }
