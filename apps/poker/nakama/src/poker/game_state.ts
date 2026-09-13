@@ -484,6 +484,14 @@ export function endHandWithSingleWinner(state: GameState): { winnerId: string; a
 
   winner.chips += totalPot;
 
+  // Clear pots/betting state so a same-tick queued PLAYER_ACTION cannot
+  // re-award the completed pot via handlePostAction.
+  state.pots = [{ amount: 0, eligiblePlayers: [] }];
+  state.currentBet = 0;
+  state.minRaise = state.bigBlind;
+  state.lastRaiseAmount = 0;
+  state.actionsThisRound = 0;
+
   // Reset to waiting phase
   state.phase = GamePhase.Waiting;
 

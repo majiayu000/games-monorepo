@@ -5,6 +5,7 @@
 
 import {
   GameState,
+  GamePhase,
   Player,
   PlayerAction,
   PlayerStatus,
@@ -31,6 +32,15 @@ export interface ActionResult {
 /**
  * Validate and execute a player action
  */
+function isActiveBettingPhase(phase: GamePhase): boolean {
+  return (
+    phase === GamePhase.PreFlop ||
+    phase === GamePhase.Flop ||
+    phase === GamePhase.Turn ||
+    phase === GamePhase.River
+  );
+}
+
 export function executePlayerAction(
   state: GameState,
   playerId: string,
@@ -41,6 +51,13 @@ export function executePlayerAction(
 
   if (!player) {
     return { success: false, error: 'Player not found' };
+  }
+
+  // Reject queued actions after a same-tick disconnect fold-win (or any
+  // non-betting phase). Otherwise a check can re-enter handlePostAction and
+  // award the uncleared pot a second time.
+  if (!isActiveBettingPhase(state.phase)) {
+    return { success: false, error: 'Hand is not in a betting phase' };
   }
 
   // Check if it's this player's turn

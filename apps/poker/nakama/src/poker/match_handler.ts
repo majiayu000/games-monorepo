@@ -31,6 +31,7 @@ import {
   flushPendingHandStatistics,
   flushPendingLeaderboardUpdates,
   getWalletBalance,
+  HandStatsJournalBatch,
   normalizeBlind,
   settleCashOutsAndEscrowCheckpoint,
   writeMatchEscrowBatch,
@@ -41,6 +42,9 @@ const TICK_RATE = 10;
 /** Flush pending hand stats at most once every N seconds while Waiting */
 const PENDING_STATS_FLUSH_INTERVAL_SECONDS = 5;
 const PENDING_STATS_FLUSH_INTERVAL_TICKS = PENDING_STATS_FLUSH_INTERVAL_SECONDS * TICK_RATE;
+/** Renew escrow leases so remote-node orphan recovery stays fenced. */
+const ESCROW_LEASE_RENEW_INTERVAL_SECONDS = 5 * 60;
+const ESCROW_LEASE_RENEW_INTERVAL_TICKS = ESCROW_LEASE_RENEW_INTERVAL_SECONDS * TICK_RATE;
 
 // Turn timeout in seconds
 const TURN_TIMEOUT_SECONDS = 30;
@@ -1104,8 +1108,9 @@ function cashOutAndRemovePlayer(
 
 /**
  * After a hand completes, settle players marked pendingLeave and optionally sync escrow.
- * When syncing, pending cash-outs and remaining escrow share one atomic write so a crash
- * cannot credit a departing winner while losers keep stale pre-hand escrow.
+ * When syncing, pending cash-outs, remaining escrow, and optional hand-stat journals
+ * share one atomic write so a crash cannot credit a departing winner while losers keep
+ * stale pre-hand escrow, and get_chips cannot apply stats against a voided checkpoint.
  * Returns false when the post-hand escrow checkpoint fails (callers must defer publish).
  */
 function settlePendingLeaves(
@@ -1113,7 +1118,8 @@ function settlePendingLeaves(
   dispatcher: nkruntime.MatchDispatcher,
   nk: nkruntime.Nakama,
   logger: nkruntime.Logger,
-  syncEscrowForRemaining: boolean
+  syncEscrowForRemaining: boolean,
+  handStats?: HandStatsJournalBatch
 ): boolean {
   const toSettle = Object.entries(state.players).filter(([, player]) => !!player.pendingLeave);
   const remaining = Object.entries(state.players).filter(([, player]) => !player.pendingLeave);
@@ -1138,7 +1144,8 @@ function settlePendingLeaves(
         state.matchId,
         toSettle.map(([userId, player]) => ({ userId, amount: player.chips })),
         remaining.map(([userId, player]) => ({ userId, amount: player.chips })),
-        logger
+        logger,
+        handStats
       );
       state.escrowCheckpointFailed = false;
 
@@ -1193,6 +1200,20 @@ function settlePendingLeaves(
   return true;
 }
 
+function handStatsBatchFromPending(
+  state: GameState,
+  pending: NonNullable<GameState['pendingHandPublish']>
+): HandStatsJournalBatch | undefined {
+  if (pending.statsJournaled) {
+    return undefined;
+  }
+  const ops = buildHandBookkeepingOps(state, pending.winners, pending.contributions);
+  if (ops.length === 0) {
+    return undefined;
+  }
+  return { handNumber: state.handNumber, ops };
+}
+
 /**
  * Retry a failed post-hand escrow checkpoint (including any still-pending leaves).
  * Returns true when cleared or unused.
@@ -1209,10 +1230,17 @@ function retryEscrowCheckpointIfNeeded(
     return true;
   }
 
+  const pendingStats = state.pendingHandPublish
+    ? handStatsBatchFromPending(state, state.pendingHandPublish)
+    : undefined;
+
   const hadPending = Object.values(state.players).some((p) => p.pendingLeave);
   if (hadPending) {
-    const ok = settlePendingLeaves(state, dispatcher, nk, logger, true);
+    const ok = settlePendingLeaves(state, dispatcher, nk, logger, true, pendingStats);
     if (ok) {
+      if (state.pendingHandPublish && pendingStats) {
+        state.pendingHandPublish.statsJournaled = true;
+      }
       publishPendingHandResultIfAny(state, dispatcher, nk, logger);
     }
     return ok;
@@ -1220,13 +1248,18 @@ function retryEscrowCheckpointIfNeeded(
 
   const remaining = Object.entries(state.players);
   try {
-    writeMatchEscrowBatch(
+    settleCashOutsAndEscrowCheckpoint(
       nk,
       state.matchId,
+      [],
       remaining.map(([userId, player]) => ({ userId, amount: player.chips })),
-      logger
+      logger,
+      pendingStats
     );
     state.escrowCheckpointFailed = false;
+    if (state.pendingHandPublish && pendingStats) {
+      state.pendingHandPublish.statsJournaled = true;
+    }
     logger.info('Post-hand escrow checkpoint retry succeeded', { matchId: state.matchId });
     publishPendingHandResultIfAny(state, dispatcher, nk, logger);
     return true;
@@ -1542,6 +1575,32 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
   // Globally expire abandoned spectator intents (not only when a join runs for that match)
   purgeExpiredSpectatorIntents();
 
+  // Renew escrow leases so surviving nodes can reclaim buy-ins after a remote
+  // owner node permanently disappears (fenced by ESCROW_ORPHAN_LEASE_MS).
+  const seatedPlayers = Object.entries(state.players);
+  if (seatedPlayers.length > 0) {
+    const lastLease = state.lastEscrowLeaseTouchTick ?? 0;
+    if (tick - lastLease >= ESCROW_LEASE_RENEW_INTERVAL_TICKS) {
+      state.lastEscrowLeaseTouchTick = tick;
+      try {
+        writeMatchEscrowBatch(
+          nk,
+          state.matchId,
+          seatedPlayers.map(([userId, player]) => ({
+            userId,
+            amount: player.chips + (player.totalBetThisHand || 0),
+          })),
+          logger
+        );
+      } catch (e) {
+        logger.warn('Failed to renew match escrow leases', {
+          matchId: state.matchId,
+          error: e,
+        });
+      }
+    }
+  }
+
   // Retry cash-outs that previously failed persistence (only pendingLeave seats)
   if (state.phase === GamePhase.Waiting) {
     const hadPending = Object.values(state.players).some((p) => p.pendingLeave);
@@ -1719,27 +1778,24 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       // Reset for next hand before durable checkpoint
       state.phase = GamePhase.Waiting;
 
-      // Journal stats before the escrow checkpoint so a crash after durable
-      // stacks still leaves hand_stats_pending for later flush.
-      const showdownStatsJournaled = journalHandBookkeeping(
-        state,
-        nk,
-        logger,
-        showdownResult.winners,
-        showdownContributions
-      );
-
-      // Persist resolved stacks BEFORE exposing the hand result so a crash
-      // cannot leave clients with an announced outcome while escrow still has
-      // the pre-hand distribution.
-      if (!settlePendingLeaves(state, dispatcher, nk, logger, true)) {
+      // Persist resolved stacks AND hand-stat journals in one atomic write so
+      // get_chips cannot apply career stats against a voided pre-hand escrow.
+      const showdownStatsBatch: HandStatsJournalBatch = {
+        handNumber: state.handNumber,
+        ops: buildHandBookkeepingOps(
+          state,
+          showdownResult.winners,
+          showdownContributions
+        ),
+      };
+      if (!settlePendingLeaves(state, dispatcher, nk, logger, true, showdownStatsBatch)) {
         // Defer flush + broadcasts until checkpoint retry succeeds.
         state.pendingHandPublish = {
           kind: 'showdown',
           winners: showdownResult.winners,
           showdownPlayers: showdownResult.showdownPlayers,
           contributions: showdownContributions,
-          statsJournaled: showdownStatsJournaled,
+          statsJournaled: false,
         };
         break;
       }
@@ -1979,23 +2035,19 @@ function handlePostAction(
           odid: result.winnerId,
           amount: result.amount,
         }];
-        // Journal before checkpoint so wallet durability cannot outlive stats.
-        const foldStatsJournaled = journalHandBookkeeping(
-          state,
-          nk,
-          logger,
-          foldWinners,
-          foldWinContributions
-        );
-        // Persist stacks before announcing the fold-win result so crash recovery
-        // cannot erase an already-exposed hand outcome.
-        if (!settlePendingLeaves(state, dispatcher, nk, logger, true)) {
+        // Journal hand stats with the escrow checkpoint so a failed/crashed
+        // checkpoint cannot leave applied career stats against pre-hand stacks.
+        const foldStatsBatch: HandStatsJournalBatch = {
+          handNumber: state.handNumber,
+          ops: buildHandBookkeepingOps(state, foldWinners, foldWinContributions),
+        };
+        if (!settlePendingLeaves(state, dispatcher, nk, logger, true, foldStatsBatch)) {
           state.pendingHandPublish = {
             kind: 'fold_win',
             winners: foldWinners,
             showdownPlayers: [],
             contributions: foldWinContributions,
-            statsJournaled: foldStatsJournaled,
+            statsJournaled: false,
           };
           return;
         }
@@ -2143,6 +2195,14 @@ const matchTerminate: nkruntime.MatchTerminateFunction<GameState> = function(
       flushHandBookkeeping(state, nk, logger, pending.winners, pending.contributions);
     } else {
       recordHandBookkeeping(state, nk, logger, pending.winners, pending.contributions);
+    }
+    // Drop in-memory retries for this hand so persistPendingHandStatRetries
+    // cannot recreate journals already written/applied above.
+    if (state.pendingHandStatRetries) {
+      const remaining = state.pendingHandStatRetries.filter(
+        (retry) => retry.handNumber !== state.handNumber
+      );
+      state.pendingHandStatRetries = remaining.length > 0 ? remaining : undefined;
     }
     state.pendingHandPublish = undefined;
   }

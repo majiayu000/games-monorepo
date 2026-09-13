@@ -661,6 +661,12 @@ export function useNakama() {
         }
       } catch (refreshError) {
         console.warn('Failed to refresh wallet after leave:', refreshError)
+        // Treat settlement as unknown until a successful get_chips response.
+        const pollGen = ++deferredCashoutPollGenRef.current
+        void refreshWalletUntilEscrowCleared(
+          getChips,
+          () => deferredCashoutPollGenRef.current === pollGen
+        )
       }
       console.log('Left match')
     } catch (error) {

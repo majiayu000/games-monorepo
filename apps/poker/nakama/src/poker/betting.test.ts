@@ -155,6 +155,14 @@ function setupThreePlayerGame(): { state: GameState; player1: Player; player2: P
 
 describe('Betting Logic', () => {
   describe('executePlayerAction - Validation', () => {
+    it('should fail if hand is not in a betting phase', () => {
+      const { state } = setupTwoPlayerGame();
+      state.phase = GamePhase.Waiting;
+      const result = executePlayerAction(state, 'p1', PlayerAction.Check);
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Hand is not in a betting phase');
+    });
+
     it('should fail if player not found', () => {
       const { state } = setupTwoPlayerGame();
       const result = executePlayerAction(state, 'nonexistent', PlayerAction.Fold);

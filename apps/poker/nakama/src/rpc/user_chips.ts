@@ -73,6 +73,21 @@ export interface MatchEscrowRecord {
   updatedAt: number;
 }
 
+/**
+ * When matchGet cannot prove a remote-node match is dead, escrows older than
+ * this lease may be refunded by surviving nodes (owner node permanently gone).
+ * Live matches renew updatedAt via writeMatchEscrowBatch / settlement.
+ */
+export const ESCROW_ORPHAN_LEASE_MS = 30 * 60 * 1000;
+
+export function isEscrowLeaseExpired(
+  record: Pick<MatchEscrowRecord, 'createdAt' | 'updatedAt'>,
+  now: number = Date.now()
+): boolean {
+  const anchor = record.updatedAt || record.createdAt || 0;
+  return anchor > 0 && now - anchor >= ESCROW_ORPHAN_LEASE_MS;
+}
+
 export interface EscrowCashOutEntry {
   userId: string;
   amount: number;
@@ -81,6 +96,17 @@ export interface EscrowCashOutEntry {
 export interface EscrowCheckpointEntry {
   userId: string;
   amount: number;
+}
+
+export interface HandStatsJournalEntry {
+  userId: string;
+  netChange: number;
+  wonHand: boolean;
+}
+
+export interface HandStatsJournalBatch {
+  handNumber: number;
+  ops: HandStatsJournalEntry[];
 }
 
 export interface PendingHandStatRecord {
@@ -708,10 +734,15 @@ export function reconcileOrphanedEscrows(
         continue;
       }
       if (liveness === 'unknown') {
+        if (!isEscrowLeaseExpired(record)) {
+          logger.warn(
+            `Skipping escrow reconcile for ${userId} match ${record.matchId}: match liveness unknown`
+          );
+          continue;
+        }
         logger.warn(
-          `Skipping escrow reconcile for ${userId} match ${record.matchId}: match liveness unknown`
+          `Reconciling escrow for ${userId} match ${record.matchId}: liveness unknown but lease expired`
         );
-        continue;
       }
 
       const amount = Math.max(0, Math.floor(record.amount || 0));
@@ -943,13 +974,16 @@ export function creditCashOutWithEscrowSettle(
  * Atomically settle pending cash-outs and checkpoint remaining escrow in one
  * storageWrite. Prevents a crash window where a pending leave is credited while
  * other seats still hold pre-hand escrow that later reconciles into inflation.
+ * Optional hand-stat journals share the same write so get_chips cannot apply
+ * career stats against a voided (pre-hand) escrow checkpoint.
  */
 export function settleCashOutsAndEscrowCheckpoint(
   nk: nkruntime.Nakama,
   matchId: string,
   cashOuts: EscrowCashOutEntry[],
   remaining: EscrowCheckpointEntry[],
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  handStats?: HandStatsJournalBatch
 ): { settledUserIds: string[] } {
   if (!matchId) {
     throw new Error('Match id is required for hand settlement');
@@ -957,8 +991,10 @@ export function settleCashOutsAndEscrowCheckpoint(
 
   const cashOutList = cashOuts.filter((entry) => !!entry.userId);
   const remainingList = remaining.filter((entry) => !!entry.userId);
+  const journalOps = (handStats?.ops || []).filter((op) => !!op.userId);
+  const journalHandNumber = handStats?.handNumber;
 
-  if (cashOutList.length === 0 && remainingList.length === 0) {
+  if (cashOutList.length === 0 && remainingList.length === 0 && journalOps.length === 0) {
     return { settledUserIds: [] };
   }
 
@@ -1067,6 +1103,28 @@ export function settleCashOutsAndEscrowCheckpoint(
         });
       }
 
+      if (journalOps.length > 0 && journalHandNumber !== undefined) {
+        for (const op of journalOps) {
+          const record: PendingHandStatRecord = {
+            matchId,
+            userId: op.userId,
+            handNumber: journalHandNumber,
+            netChange: op.netChange,
+            wonHand: op.wonHand,
+            createdAt: now,
+            status: 'pending',
+          };
+          writes.push({
+            collection: HAND_STATS_PENDING_COLLECTION,
+            key: pendingHandStatKey(matchId, journalHandNumber),
+            userId: op.userId,
+            value: record,
+            permissionRead: 1,
+            permissionWrite: 0,
+          });
+        }
+      }
+
       if (writes.length > 0) {
         nk.storageWrite(writes);
       }
@@ -1077,7 +1135,7 @@ export function settleCashOutsAndEscrowCheckpoint(
       }
 
       logger.info(
-        `Atomic hand settlement for ${matchId}: cashedOut=[${settledUserIds.join(',')}] remaining=${remainingList.length}`
+        `Atomic hand settlement for ${matchId}: cashedOut=[${settledUserIds.join(',')}] remaining=${remainingList.length} handStats=${journalOps.length}`
       );
 
       return { settledUserIds };

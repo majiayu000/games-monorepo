@@ -152,6 +152,12 @@ export interface GameState {
   lastPendingStatsFlushTick?: number;
 
   /**
+   * Match tick of the last escrow lease renewal (updatedAt touch).
+   * Surviving nodes use lease expiry to reclaim escrow when a remote owner node is gone.
+   */
+  lastEscrowLeaseTouchTick?: number;
+
+  /**
    * In-memory hand-stat retries when durable queue write also fails.
    * Retried on Waiting ticks until persisted to hand_stats_pending.
    */
@@ -187,7 +193,10 @@ export interface GameState {
       contributed: number;
       status: PlayerStatus;
     }[];
-    /** True when participant journals were already written before the checkpoint attempt. */
+    /**
+     * True when participant journals were committed atomically with a successful
+     * escrow checkpoint (safe to flush without re-journaling).
+     */
     statsJournaled?: boolean;
   };
 }

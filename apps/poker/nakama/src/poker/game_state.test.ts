@@ -1090,6 +1090,7 @@ describe('endHandWithSingleWinner', () => {
     expect(result?.winnerId).toBe('p3');
     expect(result?.amount).toBe(200);
     expect(players[2].chips).toBe(700);
+    expect(state.pots).toEqual([{ amount: 0, eligiblePlayers: [] }]);
   });
 
   it('should set phase to Waiting', () => {

@@ -32,6 +32,8 @@ import {
   updateLeaderboardScore,
   writeMatchEscrow,
   writeMatchEscrowBatch,
+  ESCROW_ORPHAN_LEASE_MS,
+  isEscrowLeaseExpired,
   MIN_BUY_IN,
   MAX_STARTING_CHIPS,
   DEFAULT_STARTING_CHIPS,
@@ -474,6 +476,81 @@ describe('match escrow', () => {
     ]);
     expect(stillThere).toHaveLength(1);
     expect(stillThere[0].value.status).toBe('active');
+  });
+
+  it('refunds other-node escrow after lease expiry when matchGet stays null', () => {
+    const otherNodeMatch = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.nakama2';
+    const nk = createMockNk({ user1: 4000 }, { matchesAlive: {} });
+    writeMatchEscrow(nk, otherNodeMatch, 'user1', 1000, logger);
+
+    const objects = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: `escrow:${otherNodeMatch}`, userId: 'user1' },
+    ]);
+    const staleAt = Date.now() - ESCROW_ORPHAN_LEASE_MS - 1_000;
+    objects[0].value.createdAt = staleAt;
+    objects[0].value.updatedAt = staleAt;
+    (nk.storageWrite as Function)([
+      {
+        collection: 'match_escrow',
+        key: `escrow:${otherNodeMatch}`,
+        userId: 'user1',
+        value: objects[0].value,
+        version: objects[0].version,
+      },
+    ]);
+
+    expect(isEscrowLeaseExpired(objects[0].value)).toBe(true);
+    expect(getMatchLiveness(nk, otherNodeMatch, LOCAL_NODE)).toBe('unknown');
+
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger, LOCAL_NODE);
+    expect(refunded).toBe(1000);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
+  });
+
+  it('writes hand-stat journals atomically with escrow checkpoint', () => {
+    const nk = createMockNk({ user1: 5000, user2: 5000 });
+    writeMatchEscrowBatch(
+      nk,
+      'match-journal',
+      [
+        { userId: 'user1', amount: 1000 },
+        { userId: 'user2', amount: 1000 },
+      ],
+      logger
+    );
+
+    settleCashOutsAndEscrowCheckpoint(
+      nk,
+      'match-journal',
+      [],
+      [
+        { userId: 'user1', amount: 1200 },
+        { userId: 'user2', amount: 800 },
+      ],
+      logger,
+      {
+        handNumber: 7,
+        ops: [
+          { userId: 'user1', netChange: 200, wonHand: true },
+          { userId: 'user2', netChange: -200, wonHand: false },
+        ],
+      }
+    );
+
+    const escrow = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: 'escrow:match-journal', userId: 'user1' },
+      { collection: 'match_escrow', key: 'escrow:match-journal', userId: 'user2' },
+    ]);
+    expect(escrow.find((o: StoredObject) => o.userId === 'user1').value.amount).toBe(1200);
+    expect(escrow.find((o: StoredObject) => o.userId === 'user2').value.amount).toBe(800);
+
+    const pending = (nk.storageRead as Function)([
+      { collection: 'hand_stats_pending', key: 'handstat:match-journal:7', userId: 'user1' },
+      { collection: 'hand_stats_pending', key: 'handstat:match-journal:7', userId: 'user2' },
+    ]);
+    expect(pending).toHaveLength(2);
+    expect(pending[0].value.status).toBe('pending');
+    expect(pending[1].value.status).toBe('pending');
   });
 
   it('skips reconcile when localNode is missing even if matchGet returns null', () => {
