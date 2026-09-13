@@ -49,6 +49,7 @@ import {
   mergeCleanupTombstoneIntoInviteList,
   needsSenderExpiryReceiverRecheck,
   needsTerminalSecretCleanup,
+  orphanMigrationCleanupTombstoneSource,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
   shouldBlockCancelForAcceptedReceiver,
@@ -1443,28 +1444,68 @@ function rpcRespondInvite(
         // But a concurrent accept may have won and still needs that secret:
         // re-read the durable status before deleting.
         if (migratedLegacySecret) {
+          const now = Date.now();
           try {
             const fresh = readInviteListOrThrow(nk, ctx.userId, 'received');
             const winning = fresh.invites.find((i) => i.inviteId === inviteId);
             if (
               shouldDeleteMigratedSecretAfterAcceptConflict(
                 winning?.status,
-                Date.now(),
+                now,
                 winning?.expiresAt ?? invite.expiresAt
               )
             ) {
               try {
                 deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
               } catch (orphanCleanupError) {
+                // Winning terminal row often stripped isPrivate — retain a
+                // cleanup tombstone so get_invites can retry the orphan delete.
                 logger.warn(
                   `Failed to delete orphan legacy migrate secret ${invite.inviteId}: ${orphanCleanupError}`
                 );
+                try {
+                  retainInviteSecretCleanupTombstone(
+                    nk,
+                    ctx.userId,
+                    'received',
+                    {
+                      ...(winning ?? invite),
+                      inviteId: invite.inviteId,
+                      senderId: invite.senderId,
+                      isPrivate: true,
+                    }
+                  );
+                } catch (tombstoneError) {
+                  logger.warn(
+                    `Failed to retain accept-migration cleanup tombstone ${invite.inviteId}: ${tombstoneError}`
+                  );
+                }
               }
             }
           } catch (reReadError) {
+            // Cannot observe winning status — still retain a cleanup reference.
+            // mergeCleanupTombstoneIntoInviteList refuses to clobber live
+            // credential-needing rows if the re-read inside retain succeeds.
             logger.warn(
               `Failed to re-read invite after accept OCC conflict ${invite.inviteId}: ${reReadError}`
             );
+            try {
+              retainInviteSecretCleanupTombstone(
+                nk,
+                ctx.userId,
+                'received',
+                orphanMigrationCleanupTombstoneSource(
+                  invite.inviteId,
+                  invite.senderId,
+                  ctx.userId,
+                  now
+                )
+              );
+            } catch (tombstoneError) {
+              logger.warn(
+                `Failed to retain accept-migration cleanup tombstone after re-read failure ${invite.inviteId}: ${tombstoneError}`
+              );
+            }
           }
         }
         return JSON.stringify({
@@ -1936,14 +1977,36 @@ function compensateStaleLegacyMigrations(
   userId: string,
   type: 'sent' | 'received',
   newlyMigratedSecrets: ReadonlyArray<{ inviteId: string; senderId: string }>,
-  now: number
+  now: number,
+  maxReadAttempts: number = 5
 ): void {
-  let durableInvites: GameInvite[] = [];
-  try {
-    durableInvites = readInviteListOrThrow(nk, userId, type).invites;
-  } catch {
-    // If we cannot read the winning list, leave secrets for get_invites cleanup
-    // rather than risk deleting an accept-needed credential.
+  let durableInvites: GameInvite[] | null = null;
+  for (let attempt = 0; attempt < maxReadAttempts; attempt++) {
+    try {
+      durableInvites = readInviteListOrThrow(nk, userId, type).invites;
+      break;
+    } catch {
+      // Transient read failure — retry before abandoning compensation.
+    }
+  }
+  if (durableInvites === null) {
+    // Winning decline/cancel stripped inline password and never persisted our
+    // isPrivate marker — get_invites cannot discover these orphans without a
+    // cleanup reference. Retain tombstones; merge refuses to clobber live
+    // credential-needing rows if the list becomes readable mid-retain.
+    for (const { inviteId, senderId } of newlyMigratedSecrets) {
+      try {
+        retainInviteSecretCleanupTombstone(
+          nk,
+          userId,
+          type,
+          orphanMigrationCleanupTombstoneSource(inviteId, senderId, userId, now)
+        );
+      } catch {
+        // Best-effort: leave the secret; a later successful poll may still help
+        // if another path retains a marker.
+      }
+    }
     return;
   }
   for (const { inviteId, senderId } of newlyMigratedSecrets) {
@@ -1961,21 +2024,9 @@ function compensateStaleLegacyMigrations(
         // Winning decline/cancel often stripped isPrivate — without a tombstone
         // get_invites cannot rediscover this orphaned secret. Retain one.
         try {
-          const tombstoneSource: GameInvite = winning ?? {
-            inviteId,
-            matchId: '',
-            roomName: '',
-            senderId,
-            senderName: '',
-            receiverId: userId,
-            receiverName: '',
-            status: InviteStatus.CANCELLED,
-            currentPlayers: 0,
-            maxPlayers: 0,
-            createdAt: now,
-            expiresAt: now,
-            isPrivate: true,
-          };
+          const tombstoneSource: GameInvite =
+            winning ??
+            orphanMigrationCleanupTombstoneSource(inviteId, senderId, userId, now);
           retainInviteSecretCleanupTombstone(nk, userId, type, {
             ...tombstoneSource,
             senderId,
@@ -2086,7 +2137,11 @@ function retainInviteSecretCleanupTombstone(
   let lastError: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const current = readInviteListOrThrow(nk, userId, type);
-    const withTombstone = mergeCleanupTombstoneIntoInviteList(current.invites, drop);
+    const withTombstone = mergeCleanupTombstoneIntoInviteList(
+      current.invites,
+      drop,
+      Date.now()
+    );
     try {
       writeInvites(nk, userId, type, withTombstone, {
         expectedVersion: current.version,

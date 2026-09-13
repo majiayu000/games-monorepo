@@ -151,16 +151,57 @@ export function invitesForOwnerHistoryStorage(
 
 /**
  * Upsert a cleanup tombstone without relying on an unversioned full-list restore.
+ * Never clobbers a live credential-needing row (SENDING/PENDING/ACCEPTED) —
+ * orphan-migration compensation may retain tombstones before it can observe
+ * the winning status, and replacing an ACCEPTED join-retry row would be fatal.
  */
 export function mergeCleanupTombstoneIntoInviteList(
   invites: GameInvite[],
-  tombstoneSource: GameInvite
+  tombstoneSource: GameInvite,
+  now: number = Date.now()
 ): GameInvite[] {
+  const existing = invites.find(
+    (invite) => invite.inviteId === tombstoneSource.inviteId
+  );
+  if (
+    existing &&
+    !isInviteSecretCleanupOnly(existing) &&
+    inviteMayRetainPasswordSecret(existing, now)
+  ) {
+    return invites;
+  }
   const tombstone = inviteSecretCleanupTombstone(tombstoneSource);
   return [
     ...invites.filter((invite) => invite.inviteId !== tombstone.inviteId),
     tombstone,
   ];
+}
+
+/**
+ * Synthetic source for orphan-migration cleanup when the durable invite row
+ * was stripped of isPrivate / inline password by a winning terminal write.
+ */
+export function orphanMigrationCleanupTombstoneSource(
+  inviteId: string,
+  senderId: string,
+  ownerUserId: string,
+  now: number
+): GameInvite {
+  return {
+    inviteId,
+    matchId: '',
+    roomName: '',
+    senderId,
+    senderName: '',
+    receiverId: ownerUserId,
+    receiverName: '',
+    status: InviteStatus.CANCELLED,
+    currentPlayers: 0,
+    maxPlayers: 0,
+    createdAt: now,
+    expiresAt: now,
+    isPrivate: true,
+  };
 }
 
 /**

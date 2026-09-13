@@ -30,6 +30,7 @@ import {
   mergeCleanupTombstoneIntoInviteList,
   needsSenderExpiryReceiverRecheck,
   needsTerminalSecretCleanup,
+  orphanMigrationCleanupTombstoneSource,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
   shouldBlockCancelForAcceptedReceiver,
@@ -1318,6 +1319,110 @@ describe('invite password attachment from matchSignal', () => {
     }
     expect(deleteFailed).toBe(true);
     expect(tombstoneRetained).toBe(true);
+  });
+
+  it('accept OCC migrate cleanup retains a tombstone when orphan delete fails', () => {
+    const now = Date.now();
+    const invite: GameInvite = {
+      inviteId: 'inv-accept-mig',
+      matchId: 'm1',
+      roomName: 'Room',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+    };
+    const winningDeclined: GameInvite = {
+      ...invite,
+      status: InviteStatus.DECLINED,
+      // Winning decline stripped inline password / isPrivate.
+    };
+    expect(
+      shouldDeleteMigratedSecretAfterAcceptConflict(
+        winningDeclined.status,
+        now,
+        winningDeclined.expiresAt
+      )
+    ).toBe(true);
+
+    let tombstoneRetained = false;
+    try {
+      throw new Error('transient storageDelete failure');
+    } catch (_orphanCleanupError) {
+      const withTombstone = mergeCleanupTombstoneIntoInviteList(
+        [winningDeclined],
+        {
+          ...winningDeclined,
+          inviteId: invite.inviteId,
+          senderId: invite.senderId,
+          isPrivate: true,
+        }
+      );
+      tombstoneRetained = withTombstone.some(
+        (i) =>
+          i.inviteId === 'inv-accept-mig' &&
+          isInviteSecretCleanupOnly(i) &&
+          i.isPrivate === true
+      );
+    }
+    expect(tombstoneRetained).toBe(true);
+  });
+
+  it('compensation retains a cleanup reference when the winning list cannot be read', () => {
+    const now = Date.now();
+    const newlyMigrated = [{ inviteId: 'inv-orphan-read', senderId: 'host-1' }];
+    // Simulate: authoritative read failed after OCC loss — still retain a
+    // retryable cleanup reference rather than abandoning the orphan forever.
+    let listReadable = false;
+    let retained: GameInvite[] = [];
+    if (!listReadable) {
+      for (const { inviteId, senderId } of newlyMigrated) {
+        retained = mergeCleanupTombstoneIntoInviteList(
+          retained,
+          orphanMigrationCleanupTombstoneSource(inviteId, senderId, 'guest-1', now),
+          now
+        );
+      }
+    }
+    expect(retained).toHaveLength(1);
+    expect(isInviteSecretCleanupOnly(retained[0])).toBe(true);
+    expect(retained[0].isPrivate).toBe(true);
+    expect(needsTerminalSecretCleanup(retained[0], now)).toBe(true);
+
+    // Safe merge: do not clobber a live ACCEPTED join-retry row.
+    const accepted: GameInvite = {
+      inviteId: 'inv-orphan-read',
+      matchId: 'm1',
+      roomName: 'Room',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.ACCEPTED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+      isPrivate: true,
+    };
+    const preserved = mergeCleanupTombstoneIntoInviteList(
+      [accepted],
+      orphanMigrationCleanupTombstoneSource(
+        'inv-orphan-read',
+        'host-1',
+        'guest-1',
+        now
+      ),
+      now
+    );
+    expect(preserved).toHaveLength(1);
+    expect(preserved[0].status).toBe(InviteStatus.ACCEPTED);
+    expect(isInviteSecretCleanupOnly(preserved[0])).toBe(false);
   });
 
   it('sent-side EXPIRED terminal cleanup rechecks the receiver instead of deleting', () => {
