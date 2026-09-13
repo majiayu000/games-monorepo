@@ -42,6 +42,7 @@ import { createGameEventLogger, GameEventLogger, GameEventType } from './game-ev
 import {
   ReplayBuffer, ReplayPlayer, ReplayConfig, saveReplay, createReplayBuffer
 } from './replay';
+import { handleMatchSignalPayload } from './invite-password';
 
 // Match-specific loggers and metrics storage
 const matchLoggers = new Map<string, GameEventLogger>();
@@ -1234,6 +1235,7 @@ matchTerminate = function matchTerminate(
 
 /**
  * Handle external signals
+ * Supports get_password for authorized match players (private-room invites).
  */
 matchSignal = function matchSignal(
   ctx: nkruntime.Context,
@@ -1244,8 +1246,10 @@ matchSignal = function matchSignal(
   state: nkruntime.MatchState,
   data: string
 ): { state: nkruntime.MatchState; data?: string } | null {
+  const gameState = state as unknown as GameState;
   logger.info(`Match signal received: ${data}`);
-  return { state, data: 'signal acknowledged' };
+  const response = handleMatchSignalPayload(gameState, data);
+  return { state, data: response };
 }
 
 // Functions are assigned to global scope, no exports needed

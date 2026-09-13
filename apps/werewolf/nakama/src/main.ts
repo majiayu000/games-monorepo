@@ -27,6 +27,10 @@ import {
   getUserReplays, getReplay, getReplayByOwner, getReplayStats, getKeyEvents,
   GameReplay, ReplayListItem
 } from './werewolf/replay';
+import {
+  buildGetPasswordSignal,
+  parsePasswordFromMatchSignal,
+} from './werewolf/invite-password';
 
 // Storage collection for user stats
 const STATS_COLLECTION = 'werewolf_stats';
@@ -684,7 +688,7 @@ function rpcSendInvite(
     }
 
     const match = matches[0];
-    let matchLabel: { roomName?: string; maxPlayers?: number; password?: string; phase?: string } = {};
+    let matchLabel: { roomName?: string; maxPlayers?: number; isPrivate?: boolean; phase?: string } = {};
     try {
       matchLabel = JSON.parse(match.label || '{}');
     } catch {
@@ -709,6 +713,23 @@ function rpcSendInvite(
     }
     const receiver = receiverUsers[0];
 
+    // Private rooms: password is never in the public label — load via matchSignal
+    let invitePassword: string | undefined;
+    if (matchLabel.isPrivate) {
+      try {
+        const signalResponse = nk.matchSignal(matchId, buildGetPasswordSignal(ctx.userId));
+        invitePassword = parsePasswordFromMatchSignal(signalResponse);
+      } catch (e) {
+        logger.warn(`matchSignal get_password failed for ${matchId}: ${e}`);
+      }
+      if (!invitePassword) {
+        return JSON.stringify({
+          success: false,
+          error: 'Failed to load private room password',
+        });
+      }
+    }
+
     // Create invite
     const now = Date.now();
     const invite: GameInvite = {
@@ -724,7 +745,7 @@ function rpcSendInvite(
       maxPlayers: matchLabel.maxPlayers || 12,
       createdAt: now,
       expiresAt: now + INVITE_CONFIG.EXPIRE_TIME,
-      password: matchLabel.password, // Include password for private rooms
+      password: invitePassword,
     };
 
     // Store invite for sender (sent invites)
