@@ -31,12 +31,15 @@ interface GetChipsResponse {
   handsWon: number;
 }
 
-interface UpdateChipsRequest {
-  amount: number;
-  reason: 'buy_in' | 'cash_out' | 'win' | 'lose' | 'bonus' | 'daily_reward';
-}
+export type ChipUpdateReason =
+  | 'buy_in'
+  | 'cash_out'
+  | 'win'
+  | 'lose'
+  | 'bonus'
+  | 'daily_reward';
 
-interface UpdateChipsResponse {
+export interface UpdateChipsResult {
   balance: number;
   previousBalance: number;
   change: number;
@@ -143,28 +146,22 @@ export const getChipsRpc: nkruntime.RpcFunction = (
 };
 
 /**
- * Update user's chip balance (server-initiated)
- * This is called internally by match handlers, not directly by clients
+ * Update user's chip balance from authoritative server paths only
+ * (match handlers, internal helpers). Not registered as a client RPC —
+ * session-authenticated clients must not mint chips with arbitrary amounts.
  */
-export const updateChipsRpc: nkruntime.RpcFunction = (
-  ctx: nkruntime.Context,
-  logger: nkruntime.Logger,
+export function updateUserChips(
   nk: nkruntime.Nakama,
-  payload: string
-): string => {
-  const userId = ctx.userId;
+  logger: nkruntime.Logger,
+  userId: string,
+  amount: number,
+  reason: ChipUpdateReason
+): UpdateChipsResult {
   if (!userId) {
-    throw new Error('User not authenticated');
+    throw new Error('User id is required');
   }
 
-  let request: UpdateChipsRequest;
-  try {
-    request = JSON.parse(payload);
-  } catch {
-    throw new Error('Invalid request payload');
-  }
-
-  if (typeof request.amount !== 'number') {
+  if (typeof amount !== 'number' || Number.isNaN(amount)) {
     throw new Error('Amount must be a number');
   }
 
@@ -172,37 +169,37 @@ export const updateChipsRpc: nkruntime.RpcFunction = (
   const previousBalance = chipsData.balance;
 
   // Update based on reason
-  switch (request.reason) {
+  switch (reason) {
     case 'buy_in':
-      if (request.amount < MIN_BUY_IN) {
+      if (amount < MIN_BUY_IN) {
         throw new Error(`Minimum buy-in is ${MIN_BUY_IN} chips`);
       }
-      if (chipsData.balance < request.amount) {
+      if (chipsData.balance < amount) {
         throw new Error('Insufficient chips for buy-in');
       }
-      chipsData.balance -= request.amount;
+      chipsData.balance -= amount;
       break;
 
     case 'cash_out':
-      if (request.amount < 0) {
+      if (amount < 0) {
         throw new Error('Cash out amount must be positive');
       }
-      chipsData.balance += request.amount;
+      chipsData.balance += amount;
       break;
 
     case 'win':
-      chipsData.balance += request.amount;
-      chipsData.totalWon += request.amount;
+      chipsData.balance += amount;
+      chipsData.totalWon += amount;
       chipsData.handsWon += 1;
       break;
 
     case 'lose':
-      chipsData.totalLost += Math.abs(request.amount);
+      chipsData.totalLost += Math.abs(amount);
       break;
 
     case 'bonus':
     case 'daily_reward':
-      chipsData.balance += request.amount;
+      chipsData.balance += amount;
       break;
 
     default:
@@ -210,21 +207,19 @@ export const updateChipsRpc: nkruntime.RpcFunction = (
   }
 
   // Increment hands played for game-related actions
-  if (request.reason === 'win' || request.reason === 'lose') {
+  if (reason === 'win' || reason === 'lose') {
     chipsData.handsPlayed += 1;
   }
 
   saveUserChips(nk, userId, chipsData);
-  logger.info(`User ${userId} chips updated: ${previousBalance} -> ${chipsData.balance} (${request.reason}: ${request.amount})`);
+  logger.info(`User ${userId} chips updated: ${previousBalance} -> ${chipsData.balance} (${reason}: ${amount})`);
 
-  const response: UpdateChipsResponse = {
+  return {
     balance: chipsData.balance,
     previousBalance,
     change: chipsData.balance - previousBalance,
   };
-
-  return JSON.stringify(response);
-};
+}
 
 /**
  * Claim daily reward
@@ -338,9 +333,10 @@ export const getLeaderboardRpc: nkruntime.RpcFunction = (
     nk.leaderboardCreate(
       LEADERBOARD_ID,
       true, // authoritative
-      'best', // sort - highest score wins
-      'set', // operator - set score directly
-      'alltime', // reset schedule - never reset
+      // Cast: nakama-runtime const enums do not accept inlined string literals under tsc
+      'descending' as nkruntime.SortOrder,
+      'set' as nkruntime.Operator,
+      null, // reset schedule - never reset
       undefined // metadata
     );
   } catch {
