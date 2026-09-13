@@ -150,6 +150,17 @@ export interface GameState {
    * Used to throttle storageList scans away from every 10 Hz tick.
    */
   lastPendingStatsFlushTick?: number;
+
+  /**
+   * In-memory hand-stat retries when durable queue write also fails.
+   * Retried on Waiting ticks until persisted to hand_stats_pending.
+   */
+  pendingHandStatRetries?: {
+    userId: string;
+    netChange: number;
+    wonHand: boolean;
+    handNumber: number;
+  }[];
 }
 
 // Messages from client to server

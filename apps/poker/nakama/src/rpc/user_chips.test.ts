@@ -634,6 +634,31 @@ describe('recordHandStatistics', () => {
     expect(payload.handsWon).toBe(1);
     expect(payload.totalWon).toBe(200);
   });
+
+  it('uses committed mutation totals for leaderboard without a post-commit wallet re-read', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+    let chipReads = 0;
+    const originalRead = nk.storageRead.bind(nk);
+    nk.storageRead = ((queries: { collection: string; key: string; userId: string }[]) => {
+      for (const q of queries) {
+        if (q.collection === 'user_data' && q.key === 'chips') {
+          chipReads += 1;
+        }
+      }
+      return originalRead(queries);
+    }) as typeof nk.storageRead;
+
+    recordHandStatistics(nk, 'user1', 150, true, logger);
+
+    // mutateWallet performs the only chips read; leaderboard must not re-read wallet storage
+    expect(chipReads).toBe(1);
+    const payload = JSON.parse(
+      getChipsRpc({ userId: 'user1' } as nkruntime.Context, logger, nk, '')
+    );
+    expect(payload.handsPlayed).toBe(1);
+    expect(payload.totalWon).toBe(150);
+  });
 });
 
 describe('updateChipsRpc', () => {

@@ -290,7 +290,7 @@ const matchJoinAttempt: nkruntime.MatchJoinAttemptFunction<GameState> = function
       return { state, accept: false, rejectMessage: 'Spectator limit reached' };
     }
     // Retain intent for matchJoin — metadata is not forwarded by Nakama
-    spectatorIntents[`${state.matchId}:${presence.userId}`] = true;
+    spectatorIntents[`${state.matchId}:${presence.userId}`] = { tick };
     return { state, accept: true };
   }
 
@@ -318,8 +318,45 @@ const matchJoinAttempt: nkruntime.MatchJoinAttemptFunction<GameState> = function
   return { state, accept: true };
 };
 
-// Track users who want to join as spectators (used between matchJoinAttempt and matchJoin)
-const spectatorIntents: { [key: string]: boolean } = {};
+// Track users who want to join as spectators (used between matchJoinAttempt and matchJoin).
+// Bound to join-attempt tick so abandoned intents expire instead of seating later buy-ins as spectators.
+const SPECTATOR_INTENT_TTL_TICKS = TICK_RATE * 30; // 30 seconds at match tick rate
+const spectatorIntents: { [key: string]: { tick: number } } = {};
+
+function spectatorIntentKey(matchId: string, userId: string): string {
+  return `${matchId}:${userId}`;
+}
+
+function purgeExpiredSpectatorIntents(matchId: string, tick: number): void {
+  const prefix = `${matchId}:`;
+  for (const key of Object.keys(spectatorIntents)) {
+    if (!key.startsWith(prefix)) {
+      continue;
+    }
+    const intent = spectatorIntents[key];
+    if (!intent || tick - intent.tick > SPECTATOR_INTENT_TTL_TICKS) {
+      delete spectatorIntents[key];
+    }
+  }
+}
+
+function kickPresenceSafe(
+  dispatcher: nkruntime.MatchDispatcher,
+  presence: nkruntime.Presence,
+  logger: nkruntime.Logger,
+  reason: string
+): void {
+  try {
+    (dispatcher as nkruntime.MatchDispatcher & {
+      matchKick?: (presences: nkruntime.Presence[]) => void;
+    }).matchKick?.([presence]);
+  } catch (kickError) {
+    logger.warn(`Failed to kick presence (${reason})`, {
+      userId: presence.userId,
+      error: kickError,
+    });
+  }
+}
 
 /**
  * Handle player or spectator joining
@@ -336,6 +373,7 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
 
   for (const presence of presences) {
     logger.info('User joined', { userId: presence.userId, username: presence.username });
+    purgeExpiredSpectatorIntents(state.matchId, tick);
 
     // Check if this is a player rejoin
     if (((presence.userId) in state.players)) {
@@ -399,9 +437,33 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
     }
 
     // Honor spectator intent accepted in matchJoinAttempt
-    const intentKey = `${state.matchId}:${presence.userId}`;
-    if (spectatorIntents[intentKey]) {
+    const intentKey = spectatorIntentKey(state.matchId, presence.userId);
+    const intent = spectatorIntents[intentKey];
+    if (intent) {
       delete spectatorIntents[intentKey];
+      if (tick - intent.tick > SPECTATOR_INTENT_TTL_TICKS) {
+        logger.warn('Spectator intent expired before matchJoin; rejecting stale join', {
+          userId: presence.userId,
+          matchId: state.matchId,
+        });
+        sendMessage(dispatcher, OpCode.ERROR, {
+          message: 'Spectator join expired; please try again',
+        }, presence);
+        kickPresenceSafe(dispatcher, presence, logger, 'expired spectator intent');
+        continue;
+      }
+      // Recheck capacity at consume time — concurrent accepted joins can race the attempt-time count
+      if (Object.keys(state.spectators).length >= state.maxSpectators) {
+        logger.warn('Spectator intent consumed but capacity full; rejecting join', {
+          userId: presence.userId,
+          maxSpectators: state.maxSpectators,
+        });
+        sendMessage(dispatcher, OpCode.ERROR, {
+          message: 'Spectator limit reached',
+        }, presence);
+        kickPresenceSafe(dispatcher, presence, logger, 'spectator capacity');
+        continue;
+      }
       const spectator: Spectator = {
         odid: presence.userId,
         displayName: presence.username || `Spectator`,
@@ -474,16 +536,7 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
             ? `${e.message}; spectator limit reached`
             : 'Insufficient chips for buy-in; spectator limit reached',
         }, presence);
-        try {
-          (dispatcher as nkruntime.MatchDispatcher & {
-            matchKick?: (presences: nkruntime.Presence[]) => void;
-          }).matchKick?.([presence]);
-        } catch (kickError) {
-          logger.warn('Failed to kick presence after spectator-cap rejection', {
-            userId: presence.userId,
-            error: kickError,
-          });
-        }
+        kickPresenceSafe(dispatcher, presence, logger, 'spectator-cap rejection after buy-in failure');
         continue;
       }
 
@@ -727,22 +780,36 @@ function handleDisconnectedPlayers(
         player.status = PlayerStatus.SittingOut;
       }
 
-      // Waiting (or between hands): settle immediately. Mid-hand: cash out after hand ends.
+      // Waiting (or between hands): settle immediately unless a post-hand escrow
+      // checkpoint is still failing — then keep the seat pending so the atomic
+      // retry includes this cash-out instead of settling it alone against stale escrow.
       if (state.phase === GamePhase.Waiting) {
-        const settled = cashOutAndRemovePlayer(state, nk, odid, player.chips, logger);
-        if (settled) {
-          broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
-            odid: odid,
-            sittingOut: false,
-            reason: 'disconnect_timeout',
-            walletBalance: getWalletBalanceSafe(nk, odid, logger),
-          });
-        } else {
+        if (state.escrowCheckpointFailed) {
+          logger.warn(
+            'Deferring disconnect cash-out until escrow checkpoint retry succeeds',
+            { userId: odid, matchId: state.matchId }
+          );
           broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
             odid: odid,
             sittingOut: true,
-            reason: 'cashout_pending',
+            reason: 'cashout_pending_checkpoint',
           });
+        } else {
+          const settled = cashOutAndRemovePlayer(state, nk, odid, player.chips, logger);
+          if (settled) {
+            broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+              odid: odid,
+              sittingOut: false,
+              reason: 'disconnect_timeout',
+              walletBalance: getWalletBalanceSafe(nk, odid, logger),
+            });
+          } else {
+            broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+              odid: odid,
+              sittingOut: true,
+              reason: 'cashout_pending',
+            });
+          }
         }
       } else {
         broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
@@ -1017,9 +1084,18 @@ function recordHandBookkeeping(
           logger
         );
       } catch (enqueueError) {
-        logger.error('Failed to persist pending hand statistics after record failure', {
+        logger.error('Failed to persist pending hand statistics after record failure; retaining in-memory retry', {
           userId: entry.odid,
           error: enqueueError,
+        });
+        if (!state.pendingHandStatRetries) {
+          state.pendingHandStatRetries = [];
+        }
+        state.pendingHandStatRetries.push({
+          userId: entry.odid,
+          netChange,
+          wonHand,
+          handNumber: state.handNumber,
         });
       }
     }
@@ -1145,6 +1221,32 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
     const lastFlush = state.lastPendingStatsFlushTick ?? -PENDING_STATS_FLUSH_INTERVAL_TICKS;
     if (tick - lastFlush >= PENDING_STATS_FLUSH_INTERVAL_TICKS) {
       state.lastPendingStatsFlushTick = tick;
+
+      // Persist any in-memory retries that failed both record + durable enqueue
+      if (state.pendingHandStatRetries && state.pendingHandStatRetries.length > 0) {
+        const stillPending: NonNullable<GameState['pendingHandStatRetries']> = [];
+        for (const pending of state.pendingHandStatRetries) {
+          try {
+            enqueuePendingHandStatistics(
+              nk,
+              state.matchId,
+              pending.handNumber,
+              pending.userId,
+              pending.netChange,
+              pending.wonHand,
+              logger
+            );
+          } catch (e) {
+            logger.warn('In-memory pending hand-stat enqueue still failing; will retry', {
+              userId: pending.userId,
+              error: e,
+            });
+            stillPending.push(pending);
+          }
+        }
+        state.pendingHandStatRetries = stillPending.length > 0 ? stillPending : undefined;
+      }
+
       for (const userId of Object.keys(state.players)) {
         try {
           flushPendingHandStatistics(nk, userId, logger);
@@ -1287,10 +1389,25 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       // Snapshot contributions before executeShowdown clears them
       const showdownContributions = snapshotHandContributions(state);
 
-      // Execute showdown and determine winners
+      // Execute showdown and determine winners (mutates stacks in memory)
       const showdownResult = executeShowdown(state, logger);
 
-      // Broadcast showdown results
+      // Reset for next hand before durable checkpoint
+      state.phase = GamePhase.Waiting;
+
+      // Persist resolved stacks BEFORE exposing the hand result so a crash
+      // cannot leave clients with an announced outcome while escrow still has
+      // the pre-hand distribution.
+      settlePendingLeaves(state, dispatcher, nk, logger, true);
+      recordHandBookkeeping(
+        state,
+        nk,
+        logger,
+        showdownResult.winners,
+        showdownContributions
+      );
+
+      // Broadcast showdown results only after the durable checkpoint attempt
       broadcastMessage(dispatcher, OpCode.SHOWDOWN, {
         players: showdownResult.showdownPlayers
       });
@@ -1300,19 +1417,6 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
         winners: showdownResult.winners,
         showdown: showdownResult.showdownPlayers
       });
-
-      // Reset for next hand
-      state.phase = GamePhase.Waiting;
-
-      // Cash out disconnect/leave players and refresh escrow for remaining seats
-      recordHandBookkeeping(
-        state,
-        nk,
-        logger,
-        showdownResult.winners,
-        showdownContributions
-      );
-      settlePendingLeaves(state, dispatcher, nk, logger, true);
 
       // Broadcast updated game state
       broadcastMessage(dispatcher, OpCode.GAME_STATE, getPublicGameState(state));
@@ -1523,7 +1627,17 @@ function handlePostAction(
     const result = endHandWithSingleWinner(state);
 
     if (result) {
-      // Broadcast hand result
+      if (nk) {
+        // Persist stacks before announcing the fold-win result so crash recovery
+        // cannot erase an already-exposed hand outcome.
+        settlePendingLeaves(state, dispatcher, nk, logger, true);
+        recordHandBookkeeping(state, nk, logger, [{
+          odid: result.winnerId,
+          amount: result.amount,
+        }]);
+      }
+
+      // Broadcast hand result after durable checkpoint attempt
       broadcastMessage(dispatcher, OpCode.HAND_RESULT, {
         winners: [{
           odid: result.winnerId,
@@ -1531,14 +1645,6 @@ function handlePostAction(
         }],
         showdown: []
       });
-
-      if (nk) {
-        recordHandBookkeeping(state, nk, logger, [{
-          odid: result.winnerId,
-          amount: result.amount,
-        }]);
-        settlePendingLeaves(state, dispatcher, nk, logger, true);
-      }
 
       // Broadcast updated game state
       broadcastMessage(dispatcher, OpCode.GAME_STATE, getPublicGameState(state));

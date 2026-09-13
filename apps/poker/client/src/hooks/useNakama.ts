@@ -577,12 +577,13 @@ export function useNakama() {
     }
 
     try {
+      // Clear prior match spectator role before awaiting join — SPECTATOR_*
+      // socket events can arrive while the join promise is still pending.
+      setIsSpectator(false)
+      setSpectators([])
       const match = await socketRef.current.joinMatch(targetMatchId)
       setMatchId(match.match_id)
       setConnectionState('in_match')
-      // Reset sticky spectator role until this match's SPECTATOR_* events say otherwise
-      setIsSpectator(false)
-      setSpectators([])
       console.log('Joined match:', match.match_id)
       return match
     } catch (error) {

@@ -1380,6 +1380,9 @@ export function recordHandStatistics(
   wonHand: boolean,
   logger: nkruntime.Logger
 ): void {
+  // Capture totals from the committed mutation so a follow-up storageRead
+  // failure cannot cause callers to re-queue an already-applied hand.
+  let totalWon = 0;
   mutateWallet(nk, userId, logger, (chipsData) => {
     chipsData.handsPlayed += 1;
     if (wonHand) {
@@ -1390,10 +1393,10 @@ export function recordHandStatistics(
     } else if (netChange < 0) {
       chipsData.totalLost += Math.abs(netChange);
     }
+    totalWon = chipsData.totalWon;
   });
 
-  const chipsData = getUserChips(nk, userId, logger).data;
-  updateLeaderboardScore(nk, userId, chipsData.totalWon, logger);
+  updateLeaderboardScore(nk, userId, totalWon, logger);
 }
 
 /**
