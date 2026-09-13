@@ -575,14 +575,82 @@ describe('invite password attachment from matchSignal', () => {
     expect(secretStore['inv-expired']).toEqual({ password: 'stale-secret' });
     expect(expiredClaimIds).toEqual(['inv-expired']);
 
+    const cleanedExpiredIds: string[] = [];
     for (const inviteId of expiredClaimIds) {
       delete secretStore[inviteId];
       markInviteSecretCleanupComplete(invites.find((i) => i.inviteId === inviteId)!);
+      cleanedExpiredIds.push(inviteId);
     }
 
     expect(secretStore['inv-expired']).toBeUndefined();
+    expect(cleanedExpiredIds).toEqual(['inv-expired']);
     expect(invites[1].status).toBe(InviteStatus.DECLINED);
     expect(secretStore['inv-declined']).toEqual({ password: 'should-not-touch' });
+  });
+
+  it('expiry cleanup markers skip invites whose secret delete failed', () => {
+    const now = Date.now();
+    const invites: GameInvite[] = [
+      {
+        inviteId: 'inv-ok',
+        matchId: 'm1',
+        roomName: 'Private',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: 'guest-1',
+        receiverName: 'Guest',
+        status: InviteStatus.EXPIRED,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: 1,
+        expiresAt: 1,
+        isPrivate: true,
+      },
+      {
+        inviteId: 'inv-orphan',
+        matchId: 'm2',
+        roomName: 'Private',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: 'guest-2',
+        receiverName: 'Guest2',
+        status: InviteStatus.EXPIRED,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: 1,
+        expiresAt: 1,
+        isPrivate: true,
+      },
+    ];
+    const expiredClaimIds = invites.map((i) => i.inviteId);
+    const deleteFailsFor = new Set(['inv-orphan']);
+    const cleanedExpiredIds: string[] = [];
+
+    for (const inviteId of expiredClaimIds) {
+      const expiredInvite = invites.find((i) => i.inviteId === inviteId)!;
+      try {
+        if (deleteFailsFor.has(inviteId)) {
+          throw new Error('temporary storage unavailable');
+        }
+        markInviteSecretCleanupComplete(expiredInvite);
+        cleanedExpiredIds.push(inviteId);
+      } catch {
+        // Leave isPrivate so needsTerminalSecretCleanup can retry.
+      }
+    }
+
+    // Markers must only target successful deletes — never all expiredClaimIds.
+    expect(cleanedExpiredIds).toEqual(['inv-ok']);
+    expect(applyInviteSecretCleanupMarkers(invites, cleanedExpiredIds)).toBe(false);
+    expect(invites[0].isPrivate).toBe(false);
+    expect(invites[1].isPrivate).toBe(true);
+    expect(needsTerminalSecretCleanup(invites[1], now)).toBe(true);
+
+    // Passing all expiredClaimIds (the bug) would clear the orphan retry flag.
+    const buggyList = invites.map((i) => ({ ...i }));
+    expect(applyInviteSecretCleanupMarkers(buggyList, expiredClaimIds)).toBe(true);
+    expect(buggyList[1].isPrivate).toBe(false);
+    expect(needsTerminalSecretCleanup(buggyList[1], now)).toBe(false);
   });
 
   it('send rollback deletes secret only after invite rows are removed', () => {

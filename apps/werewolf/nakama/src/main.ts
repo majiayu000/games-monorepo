@@ -974,6 +974,9 @@ function rpcGetInvites(
           expectedVersion: listRecord.version,
         });
         // Only after the EXPIRED claim commits may secrets be deleted.
+        // Persist cleanup markers only for IDs whose secret delete succeeded —
+        // otherwise isPrivate stays true so needsTerminalSecretCleanup can retry.
+        const cleanedExpiredIds: string[] = [];
         for (const inviteId of expiredClaimIds) {
           const expiredInvite = invites.find((i) => i.inviteId === inviteId);
           if (!expiredInvite) {
@@ -982,19 +985,20 @@ function rpcGetInvites(
           try {
             deleteInvitePasswordSecret(nk, expiredInvite.inviteId, expiredInvite.senderId);
             markInviteSecretCleanupComplete(expiredInvite);
+            cleanedExpiredIds.push(inviteId);
           } catch (cleanupError) {
             logger.warn(
               `Retryable expiry secret cleanup failed for ${inviteId}: ${cleanupError}`
             );
           }
         }
-        if (expiredClaimIds.length > 0) {
+        if (cleanedExpiredIds.length > 0) {
           persistInviteCleanupMarkersBestEffort(
             nk,
             logger,
             ctx.userId,
             type,
-            expiredClaimIds,
+            cleanedExpiredIds,
             `get_invites-expiry:${ctx.userId}/${type}`
           );
         }
