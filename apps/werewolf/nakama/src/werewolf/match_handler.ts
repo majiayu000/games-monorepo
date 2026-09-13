@@ -22,6 +22,8 @@ import {
   getRoleFaction,
   isWerewolf,
   PlayerExtendedState,
+  createInitialUserStats,
+  UserStats,
 } from './types';
 import { compressMessage, compressPlayerList } from './message-compress';
 import {
@@ -42,6 +44,7 @@ import { createGameEventLogger, GameEventLogger, GameEventType } from './game-ev
 import {
   ReplayBuffer, ReplayPlayer, ReplayConfig, saveReplay, createReplayBuffer
 } from './replay';
+import { applyAchievementUpdates } from './achievements';
 
 // Match-specific loggers and metrics storage
 const matchLoggers = new Map<string, GameEventLogger>();
@@ -2437,7 +2440,7 @@ function recordGameStats(
 
     for (const player of playerData) {
       // Read existing stats
-      let stats: any;
+      let stats: UserStats;
       try {
         const objects = nk.storageRead([{
           collection: STATS_COLLECTION,
@@ -2446,63 +2449,38 @@ function recordGameStats(
         }]);
 
         if (objects.length > 0 && objects[0].value) {
-          stats = objects[0].value;
+          stats = objects[0].value as UserStats;
+          if (stats.level === undefined) {
+            stats.level = 1;
+            stats.currentXP = 0;
+            stats.totalXP = 0;
+            stats.winStreak = 0;
+            stats.maxWinStreak = 0;
+            stats.lastWinDate = '';
+          }
         } else {
-          stats = {
-            oderId: player.oderId,
-            totalGames: 0,
-            wins: 0,
-            losses: 0,
-            winRate: 0,
-            villagerWins: 0,
-            villagerGames: 0,
-            werewolfWins: 0,
-            werewolfGames: 0,
-            loversWins: 0,
-            loversGames: 0,
-            roleStats: {},
-            survivalRate: 0,
-            gamesAsSheriff: 0,
-            sheriffWins: 0,
-            firstGameAt: 0,
-            lastGameAt: 0,
-          };
+          stats = createInitialUserStats(player.oderId);
         }
       } catch {
-        stats = {
-          oderId: player.oderId,
-          totalGames: 0,
-          wins: 0,
-          losses: 0,
-          winRate: 0,
-          villagerWins: 0,
-          villagerGames: 0,
-          werewolfWins: 0,
-          werewolfGames: 0,
-          loversWins: 0,
-          loversGames: 0,
-          roleStats: {},
-          survivalRate: 0,
-          gamesAsSheriff: 0,
-          sheriffWins: 0,
-          firstGameAt: 0,
-          lastGameAt: 0,
-        };
+        stats = createInitialUserStats(player.oderId);
       }
 
       // Update total stats
       stats.totalGames++;
       if (player.isWinner) {
         stats.wins++;
+        stats.winStreak = (stats.winStreak || 0) + 1;
+        stats.maxWinStreak = Math.max(stats.maxWinStreak || 0, stats.winStreak);
       } else {
         stats.losses++;
+        stats.winStreak = 0;
       }
       stats.winRate = stats.totalGames > 0
         ? Math.round((stats.wins / stats.totalGames) * 100)
         : 0;
 
       // Update survival rate
-      const oldSurvivalWeight = (stats.totalGames - 1) * stats.survivalRate;
+      const oldSurvivalWeight = (stats.totalGames - 1) * (stats.survivalRate || 0);
       const newSurvival = player.isAlive ? 100 : 0;
       stats.survivalRate = stats.totalGames > 0
         ? Math.round((oldSurvivalWeight + newSurvival) / stats.totalGames)
@@ -2518,9 +2496,10 @@ function recordGameStats(
       }
 
       // Update lover stats
+      const loversWon = player.isLover && winner === Faction.LOVERS;
       if (player.isLover) {
         stats.loversGames++;
-        if (player.isWinner && winner === Faction.LOVERS) {
+        if (loversWon) {
           stats.loversWins++;
         }
       }
@@ -2537,7 +2516,8 @@ function recordGameStats(
       }
 
       // Update sheriff stats
-      if (player.oderId === state.sheriffId) {
+      const wasSheriff = player.oderId === state.sheriffId;
+      if (wasSheriff) {
         stats.gamesAsSheriff++;
         if (player.isWinner) {
           stats.sheriffWins++;
@@ -2545,17 +2525,43 @@ function recordGameStats(
       }
 
       // Update timestamps
-      if (stats.firstGameAt === 0) {
+      if (!stats.firstGameAt) {
         stats.firstGameAt = now;
       }
       stats.lastGameAt = now;
 
-      // Add to write batch
+      const extState = state.extendedStates.get(player.oderId);
+      try {
+        applyAchievementUpdates(nk, logger, stats, {
+          userId: player.oderId,
+          won: player.isWinner,
+          role: player.role,
+          faction: player.faction,
+          survived: player.isAlive,
+          wasSheriff,
+          isLover: player.isLover,
+          loversWon,
+          idiotRevealed: extState?.idiotRevealed || false,
+          // Skill counters not yet derived from GameState in this slice
+          seerCheckedWolves: 0,
+          witchSaved: false,
+          witchPoisonedWolf: false,
+          guardSaved: false,
+          hunterKilledWolf: false,
+          playerFactionSize: 0,
+          votedOutWolves: 0,
+          wasExposed: false,
+        });
+      } catch (e) {
+        logger.error(`Failed to update achievements for ${player.oderId}: ${e}`);
+      }
+
+      // Add to write batch (includes any XP from achievement unlocks)
       writes.push({
         collection: STATS_COLLECTION,
         key: STATS_KEY,
         userId: player.oderId,
-        value: stats,
+        value: stats as { [key: string]: any },
         permissionRead: 2, // Public read
         permissionWrite: 0, // Server-only write
       });
