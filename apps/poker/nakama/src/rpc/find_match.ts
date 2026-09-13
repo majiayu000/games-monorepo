@@ -45,6 +45,25 @@ function parseBlindsPair(
   return { ok: true, smallBlind, bigBlind };
 }
 
+/**
+ * Require at least two seats so solo tables cannot farm authoritative hand stats.
+ */
+function parseMinPlayers(
+  raw: unknown
+): { ok: true; minPlayers?: number } | { ok: false; error: string } {
+  if (raw === undefined || raw === null || raw === '') {
+    return { ok: true };
+  }
+  const value = typeof raw === 'string' ? Number(raw) : raw;
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+    return { ok: false, error: 'minPlayers must be an integer >= 2' };
+  }
+  if (value < 2) {
+    return { ok: false, error: 'minPlayers must be >= 2' };
+  }
+  return { ok: true, minPlayers: value };
+}
+
 interface FindMatchRequest {
   minPlayers?: number;
   maxPlayers?: number;
@@ -131,8 +150,16 @@ export const findMatchRpc: nkruntime.RpcFunction = function(
     label: 'Texas Hold\'em'
   };
 
-  if (request.minPlayers) {
-    params.minPlayers = request.minPlayers.toString();
+  const minPlayers = parseMinPlayers(request.minPlayers);
+  if (!minPlayers.ok) {
+    logger.warn('Rejected find_match with invalid minPlayers', {
+      minPlayers: request.minPlayers,
+      error: minPlayers.error,
+    });
+    throw Error(minPlayers.error);
+  }
+  if (minPlayers.minPlayers !== undefined) {
+    params.minPlayers = minPlayers.minPlayers.toString();
   }
   if (request.maxPlayers) {
     params.maxPlayers = request.maxPlayers.toString();
@@ -275,8 +302,16 @@ export const createPrivateMatchRpc: nkruntime.RpcFunction = function(
     label: request.label || 'Private Game'
   };
 
-  if (request.minPlayers) {
-    params.minPlayers = request.minPlayers.toString();
+  const minPlayers = parseMinPlayers(request.minPlayers);
+  if (!minPlayers.ok) {
+    logger.warn('Rejected create_private_match with invalid minPlayers', {
+      minPlayers: request.minPlayers,
+      error: minPlayers.error,
+    });
+    throw Error(minPlayers.error);
+  }
+  if (minPlayers.minPlayers !== undefined) {
+    params.minPlayers = minPlayers.minPlayers.toString();
   }
   if (request.maxPlayers) {
     params.maxPlayers = request.maxPlayers.toString();

@@ -69,6 +69,7 @@ function createMockNk(
   __leaderboardSortOrders: string[];
   __leaderboardWrites: { id: string; userId: string; score: number }[];
   __failLeaderboardWrites?: boolean;
+  __failStorageList?: boolean;
 } {
   const store = new Map<string, StoredObject>();
   let writeCount = 0;
@@ -81,6 +82,7 @@ function createMockNk(
   const leaderboardWrites: { id: string; userId: string; score: number }[] = [];
   const leaderboardScores = new Map<string, number>();
   let failLeaderboardWrites = false;
+  let failStorageList = false;
 
   for (const [userId, balance] of Object.entries(initialByUser)) {
     store.set(`${userId}:user_data:chips`, {
@@ -110,6 +112,12 @@ function createMockNk(
     },
     set __failLeaderboardWrites(value: boolean) {
       failLeaderboardWrites = value;
+    },
+    get __failStorageList() {
+      return failStorageList;
+    },
+    set __failStorageList(value: boolean) {
+      failStorageList = value;
     },
     storageRead: (queries: { collection: string; key: string; userId: string }[]) => {
       return queries
@@ -176,12 +184,31 @@ function createMockNk(
       }
       return acks;
     },
-    storageDelete: (deletes: { collection: string; key: string; userId: string }[]) => {
+    storageDelete: (
+      deletes: { collection: string; key: string; userId: string; version?: string }[]
+    ) => {
       for (const d of deletes) {
-        store.delete(`${d.userId}:${d.collection}:${d.key}`);
+        const storeKey = `${d.userId}:${d.collection}:${d.key}`;
+        const existing = store.get(storeKey);
+        if (
+          d.version !== undefined &&
+          existing &&
+          existing.version !== d.version
+        ) {
+          throw new Error('version conflict');
+        }
+        store.delete(storeKey);
       }
     },
-    storageList: (userId: string, collection: string) => {
+    storageList: (
+      userId: string,
+      collection: string,
+      _limit?: number,
+      _cursor?: string
+    ) => {
+      if (failStorageList) {
+        throw new Error('transient storageList failure');
+      }
       const objects: StoredObject[] = [];
       for (const obj of store.values()) {
         if (obj.userId === userId && obj.collection === collection) {
@@ -886,6 +913,33 @@ describe('recordHandStatistics', () => {
     expect(listed.objects).toHaveLength(1);
     expect((listed.objects[0].value as { totalWon: number }).totalWon).toBe(500);
   });
+
+  it('version-guards stale pending deletes so a concurrent higher enqueue survives', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+
+    enqueuePendingLeaderboardUpdate(nk, 'user1', 150, logger);
+    const stale = nk.storageRead([
+      { collection: 'leaderboard_pending', key: 'poker_total_won', userId: 'user1' },
+    ])[0];
+
+    enqueuePendingLeaderboardUpdate(nk, 'user1', 450, logger);
+
+    expect(() =>
+      nk.storageDelete([
+        {
+          collection: 'leaderboard_pending',
+          key: 'poker_total_won',
+          userId: 'user1',
+          version: stale.version,
+        },
+      ])
+    ).toThrow(/version conflict/);
+
+    const listed = nk.storageList('user1', 'leaderboard_pending');
+    expect(listed.objects).toHaveLength(1);
+    expect((listed.objects[0].value as { totalWon: number }).totalWon).toBe(450);
+  });
 });
 
 describe('enqueuePendingHandStatisticsBatch', () => {
@@ -979,5 +1033,37 @@ describe('getActiveEscrowTotal / get_chips escrow signal', () => {
 
     creditCashOutWithEscrowSettle(nk, 'match-live', 'user1', 1000, logger);
     expect(getActiveEscrowTotal(nk, 'user1', logger)).toBe(0);
+  });
+
+  it('returns null (unknown) when escrow listing fails instead of zero', () => {
+    const nk = createMockNk(
+      { user1: 5000 },
+      { matchesAlive: { 'match-live': true } }
+    );
+    const logger = createLogger();
+
+    debitBuyInWithEscrow(nk, 'user1', 'match-live', 1000, logger);
+    nk.__failStorageList = true;
+
+    expect(getActiveEscrowTotal(nk, 'user1', logger)).toBeNull();
+
+    const payload = JSON.parse(
+      getChipsRpc({ userId: 'user1', node: LOCAL_NODE } as nkruntime.Context, logger, nk, '')
+    );
+    expect(payload.activeEscrowTotal).toBeNull();
+  });
+});
+
+describe('pending leaderboard max-merge / versioned delete', () => {
+  it('retains the maximum queued totalWon across concurrent enqueue', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+
+    enqueuePendingLeaderboardUpdate(nk, 'user1', 400, logger);
+    enqueuePendingLeaderboardUpdate(nk, 'user1', 250, logger);
+
+    const listed = nk.storageList('user1', 'leaderboard_pending');
+    expect(listed.objects).toHaveLength(1);
+    expect((listed.objects[0].value as { totalWon: number }).totalWon).toBe(400);
   });
 });

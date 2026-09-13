@@ -37,27 +37,39 @@ const NAKAMA_PORT = '7350'
 const NAKAMA_USE_SSL = false
 const NAKAMA_SERVER_KEY = 'defaultkey'
 
-/** Grace period + hand buffer for deferred in-hand cash-out settlement. */
-const DEFERRED_CASHOUT_POLL_MS = 90_000
+/** Keep polling while deferred in-hand cash-out escrow remains (or is unknown). */
 const DEFERRED_CASHOUT_POLL_INTERVAL_MS = 2_000
+/** Safety ceiling so a permanently stuck escrow cannot poll forever in one leave. */
+const DEFERRED_CASHOUT_POLL_MAX_MS = 30 * 60_000
+
+function escrowStillPending(activeEscrowTotal: number | null | undefined): boolean {
+  // null/undefined = listing unknown; keep retrying rather than treating as cleared.
+  return activeEscrowTotal === null || activeEscrowTotal === undefined || activeEscrowTotal > 0
+}
 
 async function refreshWalletUntilEscrowCleared(
-  getChips: () => Promise<UserChipsData>
+  getChips: () => Promise<UserChipsData>,
+  shouldContinue: () => boolean
 ): Promise<void> {
-  const deadline = Date.now() + DEFERRED_CASHOUT_POLL_MS
-  while (Date.now() < deadline) {
+  const startedAt = Date.now()
+  while (shouldContinue() && Date.now() - startedAt < DEFERRED_CASHOUT_POLL_MAX_MS) {
     await new Promise((resolve) => setTimeout(resolve, DEFERRED_CASHOUT_POLL_INTERVAL_MS))
+    if (!shouldContinue()) {
+      return
+    }
     try {
       const chips = await getChips()
       useGameStore.getState().setUserChips(chips)
-      if ((chips.activeEscrowTotal ?? 0) <= 0) {
+      if (!escrowStillPending(chips.activeEscrowTotal)) {
         return
       }
     } catch (error) {
       console.warn('Deferred wallet refresh poll failed:', error)
     }
   }
-  console.warn('Timed out waiting for deferred cash-out escrow to clear')
+  if (shouldContinue()) {
+    console.warn('Timed out waiting for deferred cash-out escrow to clear')
+  }
 }
 
 // Reconnection settings
@@ -71,6 +83,7 @@ export function useNakama() {
   const socketRef = useRef<Socket | null>(null)
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isReconnectingRef = useRef(false)
+  const deferredCashoutPollGenRef = useRef(0)
 
   const {
     connectionState,
@@ -635,12 +648,16 @@ export function useNakama() {
       // Departing presence is not a reliable recipient of PLAYER_LEFT walletBalance;
       // refresh via get_chips so the lobby shows the settled balance and stats.
       // In-hand leaves defer cash-out (grace + hand resolution), so keep polling
-      // until active escrow clears or the deadline elapses.
+      // while active escrow remains (or is unknown) until settlement completes.
       try {
         const chips = await getChips()
         useGameStore.getState().setUserChips(chips)
-        if ((chips.activeEscrowTotal ?? 0) > 0) {
-          void refreshWalletUntilEscrowCleared(getChips)
+        if (escrowStillPending(chips.activeEscrowTotal)) {
+          const pollGen = ++deferredCashoutPollGenRef.current
+          void refreshWalletUntilEscrowCleared(
+            getChips,
+            () => deferredCashoutPollGenRef.current === pollGen
+          )
         }
       } catch (refreshError) {
         console.warn('Failed to refresh wallet after leave:', refreshError)

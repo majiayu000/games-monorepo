@@ -187,6 +187,8 @@ export interface GameState {
       contributed: number;
       status: PlayerStatus;
     }[];
+    /** True when participant journals were already written before the checkpoint attempt. */
+    statsJournaled?: boolean;
   };
 }
 

@@ -43,8 +43,11 @@ interface GetChipsResponse {
   totalLost: number;
   handsPlayed: number;
   handsWon: number;
-  /** Sum of still-active table escrow; lobby polls until 0 after deferred cash-out. */
-  activeEscrowTotal: number;
+  /**
+   * Sum of still-active table escrow; lobby polls until 0 after deferred cash-out.
+   * `null` means the escrow listing failed — clients must keep retrying (do not treat as cleared).
+   */
+  activeEscrowTotal: number | null;
 }
 
 interface DailyRewardResponse {
@@ -631,12 +634,13 @@ function claimOrphanedEscrowRefund(
 
 /**
  * Sum still-active match escrow amounts for a user (buy-ins not yet cashed out).
+ * Returns `null` when storage listing fails so callers do not treat "unknown" as zero.
  */
 export function getActiveEscrowTotal(
   nk: nkruntime.Nakama,
   userId: string,
   logger: nkruntime.Logger
-): number {
+): number | null {
   if (!userId) {
     return 0;
   }
@@ -650,7 +654,7 @@ export function getActiveEscrowTotal(
       listed = nk.storageList(userId, ESCROW_COLLECTION, 100, cursor);
     } catch (e) {
       logger.warn(`Failed to list active escrow for ${userId}: ${e}`);
-      return total;
+      return null;
     }
 
     for (const obj of listed.objects || []) {
@@ -1567,7 +1571,7 @@ export function recordHandStatistics(
 
 /**
  * Persist a failed leaderboard write so it can be retried later.
- * Idempotent: later totalWon values overwrite the pending record.
+ * Merges with any existing pending record using OCC and retains the maximum totalWon.
  */
 export function enqueuePendingLeaderboardUpdate(
   nk: nkruntime.Nakama,
@@ -1579,38 +1583,77 @@ export function enqueuePendingLeaderboardUpdate(
     return;
   }
 
-  const record: PendingLeaderboardRecord = {
-    userId,
-    totalWon,
-    createdAt: Date.now(),
-    status: 'pending',
-  };
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= WALLET_WRITE_MAX_ATTEMPTS; attempt++) {
+    let objects: nkruntime.StorageObject[];
+    try {
+      objects = nk.storageRead([
+        {
+          collection: LEADERBOARD_PENDING_COLLECTION,
+          key: LEADERBOARD_PENDING_KEY,
+          userId,
+        },
+      ]);
+    } catch (e) {
+      logger.error(
+        `Failed to read pending leaderboard before enqueue for ${userId}: ${e}`
+      );
+      throw e;
+    }
 
-  try {
-    nk.storageWrite([
-      {
-        collection: LEADERBOARD_PENDING_COLLECTION,
-        key: LEADERBOARD_PENDING_KEY,
-        userId,
-        value: record,
-        permissionRead: 1,
-        permissionWrite: 0,
-      },
-    ]);
-    logger.warn(
-      `Queued pending leaderboard update for ${userId} totalWon=${totalWon}`
-    );
-  } catch (e) {
-    logger.error(
-      `Failed to queue pending leaderboard update for ${userId}: ${e}`
-    );
-    throw e;
+    const existing = objects[0];
+    const previous = existing?.value as PendingLeaderboardRecord | undefined;
+    const retainedTotal =
+      previous &&
+      previous.status === 'pending' &&
+      typeof previous.totalWon === 'number'
+        ? Math.max(previous.totalWon, totalWon)
+        : totalWon;
+
+    const record: PendingLeaderboardRecord = {
+      userId,
+      totalWon: retainedTotal,
+      createdAt: Date.now(),
+      status: 'pending',
+    };
+
+    try {
+      nk.storageWrite([
+        {
+          collection: LEADERBOARD_PENDING_COLLECTION,
+          key: LEADERBOARD_PENDING_KEY,
+          userId,
+          value: record,
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: existing?.version || '*',
+        },
+      ]);
+      logger.warn(
+        `Queued pending leaderboard update for ${userId} totalWon=${retainedTotal}`
+      );
+      return;
+    } catch (e) {
+      lastError = e;
+      if (!isVersionConflict(e) || attempt === WALLET_WRITE_MAX_ATTEMPTS) {
+        logger.error(
+          `Failed to queue pending leaderboard update for ${userId}: ${e}`
+        );
+        throw e;
+      }
+      logger.warn(
+        `Pending leaderboard enqueue conflict for ${userId}, retrying (${attempt}/${WALLET_WRITE_MAX_ATTEMPTS})`
+      );
+    }
   }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 /**
  * After a successful direct leaderboard write, drop any stale pending retry whose
  * totalWon is not newer than the committed score (preserve concurrent higher retries).
+ * Deletes with the inspected OCC version so a newer concurrent enqueue is not removed.
  */
 export function clearStalePendingLeaderboardUpdate(
   nk: nkruntime.Nakama,
@@ -1622,50 +1665,61 @@ export function clearStalePendingLeaderboardUpdate(
     return;
   }
 
-  let objects: nkruntime.StorageObject[];
-  try {
-    objects = nk.storageRead([
-      {
-        collection: LEADERBOARD_PENDING_COLLECTION,
-        key: LEADERBOARD_PENDING_KEY,
-        userId,
-      },
-    ]);
-  } catch (e) {
-    logger.warn(`Failed to read pending leaderboard for stale clear ${userId}: ${e}`);
-    return;
-  }
+  for (let attempt = 1; attempt <= WALLET_WRITE_MAX_ATTEMPTS; attempt++) {
+    let objects: nkruntime.StorageObject[];
+    try {
+      objects = nk.storageRead([
+        {
+          collection: LEADERBOARD_PENDING_COLLECTION,
+          key: LEADERBOARD_PENDING_KEY,
+          userId,
+        },
+      ]);
+    } catch (e) {
+      logger.warn(`Failed to read pending leaderboard for stale clear ${userId}: ${e}`);
+      return;
+    }
 
-  if (objects.length === 0) {
-    return;
-  }
+    if (objects.length === 0) {
+      return;
+    }
 
-  const pending = objects[0].value as PendingLeaderboardRecord | undefined;
-  if (!pending) {
-    return;
-  }
+    const obj = objects[0];
+    const pending = obj.value as PendingLeaderboardRecord | undefined;
+    if (!pending) {
+      return;
+    }
 
-  // A concurrent newer hand may have queued a higher score — leave it alone.
-  if (
-    pending.status === 'pending' &&
-    typeof pending.totalWon === 'number' &&
-    pending.totalWon > committedTotalWon
-  ) {
-    return;
-  }
+    // A concurrent newer hand may have queued a higher score — leave it alone.
+    if (
+      pending.status === 'pending' &&
+      typeof pending.totalWon === 'number' &&
+      pending.totalWon > committedTotalWon
+    ) {
+      return;
+    }
 
-  try {
-    nk.storageDelete([
-      {
-        collection: LEADERBOARD_PENDING_COLLECTION,
-        key: LEADERBOARD_PENDING_KEY,
-        userId,
-      },
-    ]);
-  } catch (deleteError) {
-    logger.warn(
-      `Failed to clear stale pending leaderboard for ${userId}: ${deleteError}`
-    );
+    try {
+      nk.storageDelete([
+        {
+          collection: LEADERBOARD_PENDING_COLLECTION,
+          key: LEADERBOARD_PENDING_KEY,
+          userId,
+          version: obj.version,
+        },
+      ]);
+      return;
+    } catch (deleteError) {
+      if (!isVersionConflict(deleteError) || attempt === WALLET_WRITE_MAX_ATTEMPTS) {
+        logger.warn(
+          `Failed to clear stale pending leaderboard for ${userId}: ${deleteError}`
+        );
+        return;
+      }
+      logger.warn(
+        `Stale pending leaderboard clear conflict for ${userId}, retrying (${attempt}/${WALLET_WRITE_MAX_ATTEMPTS})`
+      );
+    }
   }
 }
 
@@ -1708,6 +1762,7 @@ export function flushPendingLeaderboardUpdates(
           collection: LEADERBOARD_PENDING_COLLECTION,
           key: LEADERBOARD_PENDING_KEY,
           userId,
+          version: obj.version,
         },
       ]);
     } catch (deleteError) {
@@ -1723,11 +1778,32 @@ export function flushPendingLeaderboardUpdates(
   }
 
   try {
+    // Re-read so we only delete the score we flushed (preserve a newer concurrent enqueue).
+    const latest = nk.storageRead([
+      {
+        collection: LEADERBOARD_PENDING_COLLECTION,
+        key: LEADERBOARD_PENDING_KEY,
+        userId,
+      },
+    ]);
+    if (latest.length === 0) {
+      return true;
+    }
+    const latestPending = latest[0].value as PendingLeaderboardRecord | undefined;
+    if (
+      latestPending &&
+      latestPending.status === 'pending' &&
+      typeof latestPending.totalWon === 'number' &&
+      latestPending.totalWon > pending.totalWon
+    ) {
+      return true;
+    }
     nk.storageDelete([
       {
         collection: LEADERBOARD_PENDING_COLLECTION,
         key: LEADERBOARD_PENDING_KEY,
         userId,
+        version: latest[0].version,
       },
     ]);
   } catch (deleteError) {

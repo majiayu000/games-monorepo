@@ -232,7 +232,10 @@ const matchInit: nkruntime.MatchInitFunction<GameState> = function(
     matchId: ctx.matchId || '',
     tickRate: TICK_RATE,
     label: label,
-    minPlayers: params.minPlayers ? parseInt(params.minPlayers) : DEFAULT_SETTINGS.minPlayers,
+    minPlayers: Math.max(
+      2,
+      params.minPlayers ? parseInt(params.minPlayers, 10) || DEFAULT_SETTINGS.minPlayers : DEFAULT_SETTINGS.minPlayers
+    ),
     maxPlayers: params.maxPlayers ? parseInt(params.maxPlayers) : DEFAULT_SETTINGS.maxPlayers,
     smallBlind,
     bigBlind,
@@ -1251,7 +1254,12 @@ function publishPendingHandResultIfAny(
     return;
   }
 
-  recordHandBookkeeping(state, nk, logger, pending.winners, pending.contributions);
+  if (pending.statsJournaled) {
+    // Journals already durable from pre-checkpoint; only apply/flush now.
+    flushHandBookkeeping(state, nk, logger, pending.winners, pending.contributions);
+  } else {
+    recordHandBookkeeping(state, nk, logger, pending.winners, pending.contributions);
+  }
 
   if (pending.kind === 'showdown' && pending.showdownPlayers) {
     broadcastMessage(dispatcher, OpCode.SHOWDOWN, {
@@ -1289,19 +1297,15 @@ function snapshotHandContributions(state: GameState): HandContributionSnapshot[]
   }));
 }
 
-/**
- * Persist career hand stats / leaderboard from authoritative hand results.
- * Prefer a pre-showdown snapshot — executeShowdown clears totalBetThisHand/status.
- * Journals every participant's pending record before applying any wallet mutation
- * so a mid-loop crash cannot leave only a subset of the table counted.
- */
-function recordHandBookkeeping(
+function buildHandBookkeepingOps(
   state: GameState,
-  nk: nkruntime.Nakama,
-  logger: nkruntime.Logger,
   winners: { odid: string; amount: number }[],
   contributions?: HandContributionSnapshot[]
-): void {
+): {
+  userId: string;
+  netChange: number;
+  wonHand: boolean;
+}[] {
   const winnerIds = new Set(winners.map((w) => w.odid));
   const winnerAmounts = new Map(winners.map((w) => [w.odid, w.amount]));
   const participants =
@@ -1340,11 +1344,25 @@ function recordHandBookkeeping(
     });
   }
 
+  return ops;
+}
+
+/**
+ * Durably journal hand-stat ops (or retain in-memory retries on failure).
+ * Returns true when the batch was written to storage.
+ */
+function journalHandBookkeeping(
+  state: GameState,
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger,
+  winners: { odid: string; amount: number }[],
+  contributions?: HandContributionSnapshot[]
+): boolean {
+  const ops = buildHandBookkeepingOps(state, winners, contributions);
   if (ops.length === 0) {
-    return;
+    return true;
   }
 
-  // Phase 1: durable journal for every participant before any stats apply.
   try {
     enqueuePendingHandStatisticsBatch(
       nk,
@@ -1353,6 +1371,7 @@ function recordHandBookkeeping(
       ops,
       logger
     );
+    return true;
   } catch (enqueueError) {
     logger.error('Failed to journal hand statistics batch; retaining in-memory retries', {
       matchId: state.matchId,
@@ -1370,10 +1389,21 @@ function recordHandBookkeeping(
         handNumber: state.handNumber,
       });
     }
-    return;
+    return false;
   }
+}
 
-  // Phase 2: apply journaled records (OCC claim); pending rows remain if flush fails.
+/**
+ * Apply previously journaled hand-stat records for this hand's participants.
+ */
+function flushHandBookkeeping(
+  state: GameState,
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger,
+  winners: { odid: string; amount: number }[],
+  contributions?: HandContributionSnapshot[]
+): void {
+  const ops = buildHandBookkeepingOps(state, winners, contributions);
   for (const op of ops) {
     try {
       flushPendingHandStatistics(nk, op.userId, logger);
@@ -1384,6 +1414,25 @@ function recordHandBookkeeping(
       });
     }
   }
+}
+
+/**
+ * Persist career hand stats / leaderboard from authoritative hand results.
+ * Prefer a pre-showdown snapshot — executeShowdown clears totalBetThisHand/status.
+ * Journals every participant's pending record before applying any wallet mutation
+ * so a mid-loop crash cannot leave only a subset of the table counted.
+ */
+function recordHandBookkeeping(
+  state: GameState,
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger,
+  winners: { odid: string; amount: number }[],
+  contributions?: HandContributionSnapshot[]
+): void {
+  if (!journalHandBookkeeping(state, nk, logger, winners, contributions)) {
+    return;
+  }
+  flushHandBookkeeping(state, nk, logger, winners, contributions);
 }
 
 /**
@@ -1670,21 +1719,32 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       // Reset for next hand before durable checkpoint
       state.phase = GamePhase.Waiting;
 
+      // Journal stats before the escrow checkpoint so a crash after durable
+      // stacks still leaves hand_stats_pending for later flush.
+      const showdownStatsJournaled = journalHandBookkeeping(
+        state,
+        nk,
+        logger,
+        showdownResult.winners,
+        showdownContributions
+      );
+
       // Persist resolved stacks BEFORE exposing the hand result so a crash
       // cannot leave clients with an announced outcome while escrow still has
       // the pre-hand distribution.
       if (!settlePendingLeaves(state, dispatcher, nk, logger, true)) {
-        // Defer bookkeeping + broadcasts until checkpoint retry succeeds.
+        // Defer flush + broadcasts until checkpoint retry succeeds.
         state.pendingHandPublish = {
           kind: 'showdown',
           winners: showdownResult.winners,
           showdownPlayers: showdownResult.showdownPlayers,
           contributions: showdownContributions,
+          statsJournaled: showdownStatsJournaled,
         };
         break;
       }
 
-      recordHandBookkeeping(
+      flushHandBookkeeping(
         state,
         nk,
         logger,
@@ -1915,24 +1975,31 @@ function handlePostAction(
       if (nk) {
         // Snapshot contributions before settlePendingLeaves clears totalBetThisHand
         const foldWinContributions = snapshotHandContributions(state);
+        const foldWinners = [{
+          odid: result.winnerId,
+          amount: result.amount,
+        }];
+        // Journal before checkpoint so wallet durability cannot outlive stats.
+        const foldStatsJournaled = journalHandBookkeeping(
+          state,
+          nk,
+          logger,
+          foldWinners,
+          foldWinContributions
+        );
         // Persist stacks before announcing the fold-win result so crash recovery
         // cannot erase an already-exposed hand outcome.
         if (!settlePendingLeaves(state, dispatcher, nk, logger, true)) {
           state.pendingHandPublish = {
             kind: 'fold_win',
-            winners: [{
-              odid: result.winnerId,
-              amount: result.amount,
-            }],
+            winners: foldWinners,
             showdownPlayers: [],
             contributions: foldWinContributions,
+            statsJournaled: foldStatsJournaled,
           };
           return;
         }
-        recordHandBookkeeping(state, nk, logger, [{
-          odid: result.winnerId,
-          amount: result.amount,
-        }], foldWinContributions);
+        flushHandBookkeeping(state, nk, logger, foldWinners, foldWinContributions);
       }
 
       // Broadcast hand result after durable checkpoint succeeds
@@ -2066,6 +2133,18 @@ const matchTerminate: nkruntime.MatchTerminateFunction<GameState> = function(
     if (key.startsWith(`${state.matchId}:`)) {
       delete spectatorIntents[key];
     }
+  }
+
+  // Journal any deferred hand result that never reached pendingHandStatRetries
+  // before termination cash-outs destroy in-memory match state.
+  if (state.pendingHandPublish) {
+    const pending = state.pendingHandPublish;
+    if (pending.statsJournaled) {
+      flushHandBookkeeping(state, nk, logger, pending.winners, pending.contributions);
+    } else {
+      recordHandBookkeeping(state, nk, logger, pending.winners, pending.contributions);
+    }
+    state.pendingHandPublish = undefined;
   }
 
   // Best-effort durable journal of in-memory hand-stat retries before state is destroyed

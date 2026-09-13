@@ -353,8 +353,11 @@ export interface UserChipsData {
   totalLost: number
   handsPlayed: number
   handsWon: number
-  /** Remaining table escrow; poll until 0 after deferred in-hand cash-out. */
-  activeEscrowTotal?: number
+  /**
+   * Remaining table escrow; poll until 0 after deferred in-hand cash-out.
+   * `null` means the server could not list escrow — keep polling.
+   */
+  activeEscrowTotal?: number | null
 }
 
 export interface DailyRewardResponse {
