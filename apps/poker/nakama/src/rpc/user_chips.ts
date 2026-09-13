@@ -7,6 +7,7 @@
 const CHIPS_COLLECTION = 'user_data';
 const CHIPS_KEY = 'chips';
 const ESCROW_COLLECTION = 'match_escrow';
+const HAND_STATS_PENDING_COLLECTION = 'hand_stats_pending';
 
 // Default starting chips for new users
 export const DEFAULT_STARTING_CHIPS = 10000;
@@ -65,6 +66,25 @@ export interface MatchEscrowRecord {
   updatedAt: number;
 }
 
+export interface EscrowCashOutEntry {
+  userId: string;
+  amount: number;
+}
+
+export interface EscrowCheckpointEntry {
+  userId: string;
+  amount: number;
+}
+
+export interface PendingHandStatRecord {
+  matchId: string;
+  userId: string;
+  handNumber: number;
+  netChange: number;
+  wonHand: boolean;
+  createdAt: number;
+}
+
 export type MatchLiveness = 'alive' | 'dead' | 'unknown';
 
 export const POKER_LEADERBOARD_ID = 'poker_total_won';
@@ -82,6 +102,10 @@ function isVersionConflict(error: unknown): boolean {
 
 function escrowKey(matchId: string): string {
   return `escrow:${matchId}`;
+}
+
+function pendingHandStatKey(matchId: string, handNumber: number): string {
+  return `handstat:${matchId}:${handNumber}`;
 }
 
 // Helper to get or initialize user chips (with storage version for OCC)
@@ -797,6 +821,278 @@ export function creditCashOutWithEscrowSettle(
 }
 
 /**
+ * Atomically settle pending cash-outs and checkpoint remaining escrow in one
+ * storageWrite. Prevents a crash window where a pending leave is credited while
+ * other seats still hold pre-hand escrow that later reconciles into inflation.
+ */
+export function settleCashOutsAndEscrowCheckpoint(
+  nk: nkruntime.Nakama,
+  matchId: string,
+  cashOuts: EscrowCashOutEntry[],
+  remaining: EscrowCheckpointEntry[],
+  logger: nkruntime.Logger
+): { settledUserIds: string[] } {
+  if (!matchId) {
+    throw new Error('Match id is required for hand settlement');
+  }
+
+  const cashOutList = cashOuts.filter((entry) => !!entry.userId);
+  const remainingList = remaining.filter((entry) => !!entry.userId);
+
+  if (cashOutList.length === 0 && remainingList.length === 0) {
+    return { settledUserIds: [] };
+  }
+
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= WALLET_WRITE_MAX_ATTEMPTS; attempt++) {
+    try {
+      const settledUserIds: string[] = [];
+      const writes: nkruntime.StorageWriteRequest[] = [];
+      const now = Date.now();
+
+      for (const entry of cashOutList) {
+        const credit = Math.max(0, Math.floor(entry.amount));
+        const escrowObjects = nk.storageRead([
+          {
+            collection: ESCROW_COLLECTION,
+            key: escrowKey(matchId),
+            userId: entry.userId,
+          },
+        ]);
+        const escrowObj = escrowObjects.length > 0 ? escrowObjects[0] : null;
+        const escrow = escrowObj?.value
+          ? (escrowObj.value as MatchEscrowRecord)
+          : null;
+
+        // Prior attempt already settled — treat as done (idempotent).
+        if (escrow && escrow.status === 'settled') {
+          settledUserIds.push(entry.userId);
+          continue;
+        }
+
+        const stored = getUserChips(nk, entry.userId, logger);
+        const previousBalance = stored.data.balance;
+        const nextWallet: UserChipsData = {
+          ...stored.data,
+          balance: previousBalance + credit,
+          lastUpdated: now,
+        };
+
+        if (escrow && escrow.status === 'active') {
+          const settled: MatchEscrowRecord = {
+            ...escrow,
+            amount: credit,
+            status: 'settled',
+            updatedAt: now,
+          };
+          writes.push(
+            {
+              collection: CHIPS_COLLECTION,
+              key: CHIPS_KEY,
+              userId: entry.userId,
+              value: nextWallet,
+              permissionRead: 1,
+              permissionWrite: 0,
+              version: stored.version,
+            },
+            {
+              collection: ESCROW_COLLECTION,
+              key: escrowKey(matchId),
+              userId: entry.userId,
+              value: settled,
+              permissionRead: 1,
+              permissionWrite: 0,
+              version: escrowObj!.version || '*',
+            }
+          );
+        } else if (credit > 0) {
+          writes.push({
+            collection: CHIPS_COLLECTION,
+            key: CHIPS_KEY,
+            userId: entry.userId,
+            value: nextWallet,
+            permissionRead: 1,
+            permissionWrite: 0,
+            version: stored.version,
+          });
+        }
+
+        settledUserIds.push(entry.userId);
+      }
+
+      for (const entry of remainingList) {
+        const amount = Math.max(0, Math.floor(entry.amount));
+        const escrowObjects = nk.storageRead([
+          {
+            collection: ESCROW_COLLECTION,
+            key: escrowKey(matchId),
+            userId: entry.userId,
+          },
+        ]);
+        const escrowObj = escrowObjects.length > 0 ? escrowObjects[0] : null;
+        const previous = escrowObj?.value
+          ? (escrowObj.value as MatchEscrowRecord)
+          : null;
+        const record: MatchEscrowRecord = {
+          matchId,
+          userId: entry.userId,
+          amount,
+          status: 'active',
+          createdAt: previous?.createdAt || now,
+          updatedAt: now,
+        };
+        writes.push({
+          collection: ESCROW_COLLECTION,
+          key: escrowKey(matchId),
+          userId: entry.userId,
+          value: record,
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: escrowObj?.version,
+        });
+      }
+
+      if (writes.length > 0) {
+        nk.storageWrite(writes);
+      }
+
+      // Best-effort cleanup of settled claim markers (safe if this fails)
+      for (const userId of settledUserIds) {
+        clearMatchEscrow(nk, matchId, userId, logger);
+      }
+
+      logger.info(
+        `Atomic hand settlement for ${matchId}: cashedOut=[${settledUserIds.join(',')}] remaining=${remainingList.length}`
+      );
+
+      return { settledUserIds };
+    } catch (e) {
+      lastError = e;
+      if (!isVersionConflict(e) || attempt === WALLET_WRITE_MAX_ATTEMPTS) {
+        logger.error(`Atomic hand settlement failed for ${matchId}: ${e}`);
+        throw e;
+      }
+      logger.warn(
+        `Atomic hand settlement conflict for ${matchId}, retrying (${attempt}/${WALLET_WRITE_MAX_ATTEMPTS})`
+      );
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/**
+ * Persist a failed hand-stat update so it can be retried later.
+ */
+export function enqueuePendingHandStatistics(
+  nk: nkruntime.Nakama,
+  matchId: string,
+  handNumber: number,
+  userId: string,
+  netChange: number,
+  wonHand: boolean,
+  logger: nkruntime.Logger
+): void {
+  if (!matchId || !userId) {
+    return;
+  }
+
+  const record: PendingHandStatRecord = {
+    matchId,
+    userId,
+    handNumber,
+    netChange,
+    wonHand,
+    createdAt: Date.now(),
+  };
+
+  try {
+    nk.storageWrite([
+      {
+        collection: HAND_STATS_PENDING_COLLECTION,
+        key: pendingHandStatKey(matchId, handNumber),
+        userId,
+        value: record,
+        permissionRead: 1,
+        permissionWrite: 0,
+      },
+    ]);
+    logger.warn(
+      `Queued pending hand statistics for ${userId} match ${matchId} hand ${handNumber}`
+    );
+  } catch (e) {
+    logger.error(
+      `Failed to queue pending hand statistics for ${userId} match ${matchId}: ${e}`
+    );
+    throw e;
+  }
+}
+
+/**
+ * Retry any pending hand-stat updates for a user. Returns how many were applied.
+ */
+export function flushPendingHandStatistics(
+  nk: nkruntime.Nakama,
+  userId: string,
+  logger: nkruntime.Logger
+): number {
+  if (!userId) {
+    return 0;
+  }
+
+  let flushed = 0;
+  let cursor = '';
+
+  do {
+    let listed: nkruntime.StorageObjectList;
+    try {
+      listed = nk.storageList(userId, HAND_STATS_PENDING_COLLECTION, 100, cursor);
+    } catch (e) {
+      logger.warn(`Failed to list pending hand statistics for ${userId}: ${e}`);
+      return flushed;
+    }
+
+    for (const obj of listed.objects || []) {
+      const pending = obj.value as PendingHandStatRecord | undefined;
+      if (!pending) {
+        continue;
+      }
+
+      try {
+        recordHandStatistics(nk, userId, pending.netChange, !!pending.wonHand, logger);
+        try {
+          nk.storageDelete([
+            {
+              collection: HAND_STATS_PENDING_COLLECTION,
+              key: obj.key,
+              userId,
+            },
+          ]);
+        } catch (deleteError) {
+          logger.warn(
+            `Applied pending hand stats but failed to delete queue entry for ${userId}: ${deleteError}`
+          );
+        }
+        flushed += 1;
+      } catch (e) {
+        logger.warn(
+          `Pending hand statistics still failing for ${userId} key ${obj.key}: ${e}`
+        );
+      }
+    }
+
+    cursor = listed.cursor || '';
+  } while (cursor);
+
+  if (flushed > 0) {
+    logger.info(`Flushed ${flushed} pending hand statistics for ${userId}`);
+  }
+
+  return flushed;
+}
+
+/**
  * Get user's chip balance and stats.
  * Also reconciles orphaned match escrow left behind by crash/shutdown.
  */
@@ -812,6 +1108,7 @@ export const getChipsRpc: nkruntime.RpcFunction = (
   }
 
   reconcileOrphanedEscrows(nk, userId, logger);
+  flushPendingHandStatistics(nk, userId, logger);
   const chipsData = getUserChips(nk, userId, logger).data;
 
   const response: GetChipsResponse = {

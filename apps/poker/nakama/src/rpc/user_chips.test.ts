@@ -11,11 +11,14 @@ import {
   creditCashOutWithEscrowSettle,
   debitBuyIn,
   debitBuyInWithEscrow,
+  enqueuePendingHandStatistics,
   ensurePokerLeaderboard,
+  flushPendingHandStatistics,
   getChipsRpc,
   getWalletBalance,
   reconcileOrphanedEscrows,
   recordHandStatistics,
+  settleCashOutsAndEscrowCheckpoint,
   updateChipsRpc,
   writeMatchEscrow,
   writeMatchEscrowBatch,
@@ -428,6 +431,56 @@ describe('match escrow', () => {
     const second = creditCashOutWithEscrowSettle(nk, 'match-1', 'user1', 1000, logger);
     expect(second.change).toBe(0);
     expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
+  });
+
+  it('settles pending cash-outs and remaining escrow in one atomic write', () => {
+    const nk = createMockNk({ winner: 4000, loser: 4000 }, { matchesAlive: {} });
+    writeMatchEscrow(nk, 'match-hand', 'winner', 1000, logger);
+    writeMatchEscrow(nk, 'match-hand', 'loser', 1000, logger);
+
+    const result = settleCashOutsAndEscrowCheckpoint(
+      nk,
+      'match-hand',
+      [{ userId: 'winner', amount: 1100 }],
+      [{ userId: 'loser', amount: 900 }],
+      logger
+    );
+
+    expect(result.settledUserIds).toEqual(['winner']);
+    expect(getWalletBalance(nk, 'winner', logger)).toBe(5100);
+    expect(getWalletBalance(nk, 'loser', logger)).toBe(4000);
+
+    const objects = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: 'escrow:match-hand', userId: 'loser' },
+      { collection: 'match_escrow', key: 'escrow:match-hand', userId: 'winner' },
+    ]);
+    const loserEscrow = objects.find((o: StoredObject) => o.userId === 'loser');
+    expect(loserEscrow.value.amount).toBe(900);
+    expect(loserEscrow.value.status).toBe('active');
+
+    // Winner escrow cleared (or settled-only); reconcile must not inflate totals.
+    const refunded = reconcileOrphanedEscrows(nk, 'winner', logger);
+    expect(refunded).toBe(0);
+    expect(getWalletBalance(nk, 'winner', logger)).toBe(5100);
+    expect(getWalletBalance(nk, 'loser', logger) + 900).toBe(4900);
+  });
+});
+
+describe('pending hand statistics', () => {
+  it('queues failed hand stats and flushes them later', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+
+    enqueuePendingHandStatistics(nk, 'match-1', 3, 'user1', 150, true, logger);
+    expect(flushPendingHandStatistics(nk, 'user1', logger)).toBe(1);
+
+    const payload = JSON.parse(
+      getChipsRpc({ userId: 'user1' } as nkruntime.Context, logger, nk, '')
+    );
+    expect(payload.handsPlayed).toBe(1);
+    expect(payload.handsWon).toBe(1);
+    expect(payload.totalWon).toBe(150);
+    expect(flushPendingHandStatistics(nk, 'user1', logger)).toBe(0);
   });
 });
 

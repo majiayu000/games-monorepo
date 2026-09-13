@@ -26,8 +26,11 @@ import {
   clampStartingChips,
   creditCashOutWithEscrowSettle,
   debitBuyInWithEscrow,
+  enqueuePendingHandStatistics,
+  flushPendingHandStatistics,
   getWalletBalance,
   recordHandStatistics,
+  settleCashOutsAndEscrowCheckpoint,
   writeMatchEscrowBatch,
 } from '../rpc/user_chips';
 
@@ -455,6 +458,32 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
         userId: presence.userId,
         error: e,
       });
+
+      // Non-spectator join path never checked spectator capacity — enforce it here
+      // so failed buy-ins cannot bypass maxSpectators.
+      if (Object.keys(state.spectators).length >= state.maxSpectators) {
+        logger.warn('Buy-in failed and spectator limit reached; rejecting join', {
+          userId: presence.userId,
+          maxSpectators: state.maxSpectators,
+        });
+        sendMessage(dispatcher, OpCode.ERROR, {
+          message: e instanceof Error
+            ? `${e.message}; spectator limit reached`
+            : 'Insufficient chips for buy-in; spectator limit reached',
+        }, presence);
+        try {
+          (dispatcher as nkruntime.MatchDispatcher & {
+            matchKick?: (presences: nkruntime.Presence[]) => void;
+          }).matchKick?.([presence]);
+        } catch (kickError) {
+          logger.warn('Failed to kick presence after spectator-cap rejection', {
+            userId: presence.userId,
+            error: kickError,
+          });
+        }
+        continue;
+      }
+
       const spectator: Spectator = {
         odid: presence.userId,
         displayName: presence.username || `Spectator`,
@@ -786,6 +815,8 @@ function cashOutAndRemovePlayer(
 
 /**
  * After a hand completes, settle players marked pendingLeave and optionally sync escrow.
+ * When syncing, pending cash-outs and remaining escrow share one atomic write so a crash
+ * cannot credit a departing winner while losers keep stale pre-hand escrow.
  */
 function settlePendingLeaves(
   state: GameState,
@@ -795,7 +826,60 @@ function settlePendingLeaves(
   syncEscrowForRemaining: boolean
 ): void {
   const toSettle = Object.entries(state.players).filter(([, player]) => !!player.pendingLeave);
+  const remaining = Object.entries(state.players).filter(([, player]) => !player.pendingLeave);
 
+  if (syncEscrowForRemaining) {
+    for (const [, player] of remaining) {
+      // After a hand, committed bets are already reflected in chips (or gone to winners).
+      // Do not add totalBetThisHand — that double-counts fold-win stacks.
+      player.totalBetThisHand = 0;
+      player.currentBet = 0;
+    }
+
+    // Also zero settled players' hand bets before amounts are read.
+    for (const [, player] of toSettle) {
+      player.totalBetThisHand = 0;
+      player.currentBet = 0;
+    }
+
+    try {
+      const result = settleCashOutsAndEscrowCheckpoint(
+        nk,
+        state.matchId,
+        toSettle.map(([userId, player]) => ({ userId, amount: player.chips })),
+        remaining.map(([userId, player]) => ({ userId, amount: player.chips })),
+        logger
+      );
+      state.escrowCheckpointFailed = false;
+
+      const settledSet = new Set(result.settledUserIds);
+      for (const [userId, player] of toSettle) {
+        if (!settledSet.has(userId)) {
+          continue;
+        }
+        const chips = player.chips;
+        delete state.players[userId];
+        logger.info('Settled pending leave after hand', { userId, chips });
+        broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+          odid: userId,
+          sittingOut: false,
+          reason: 'pending_leave_settled',
+          walletBalance: getWalletBalanceSafe(nk, userId, logger),
+        });
+      }
+    } catch (e) {
+      state.escrowCheckpointFailed = true;
+      logger.error(
+        'Atomic pending-leave + escrow checkpoint failed; pausing new hands until retry succeeds',
+        { matchId: state.matchId, error: e }
+      );
+    }
+
+    updateMatchLabel(state, dispatcher);
+    return;
+  }
+
+  // Waiting-phase retry: cash out pending leaves only (no remaining-player checkpoint).
   for (const [userId, player] of toSettle) {
     const chips = player.chips;
     const settled = cashOutAndRemovePlayer(state, nk, userId, chips, logger);
@@ -815,46 +899,27 @@ function settlePendingLeaves(
     }
   }
 
-  if (syncEscrowForRemaining) {
-    const remaining = Object.entries(state.players);
-    for (const [, player] of remaining) {
-      // After a hand, committed bets are already reflected in chips (or gone to winners).
-      // Do not add totalBetThisHand — that double-counts fold-win stacks.
-      player.totalBetThisHand = 0;
-      player.currentBet = 0;
-    }
-    // Atomic multi-object checkpoint — avoids mixed pre/post-hand escrow on crash.
-    // On failure, pause new hands until retry succeeds (fail-closed).
-    try {
-      writeMatchEscrowBatch(
-        nk,
-        state.matchId,
-        remaining.map(([userId, player]) => ({ userId, amount: player.chips })),
-        logger
-      );
-      state.escrowCheckpointFailed = false;
-    } catch (e) {
-      state.escrowCheckpointFailed = true;
-      logger.error('Post-hand escrow checkpoint failed; pausing new hands until retry succeeds', {
-        matchId: state.matchId,
-        error: e,
-      });
-    }
-  }
-
   updateMatchLabel(state, dispatcher);
 }
 
 /**
- * Retry a failed post-hand escrow checkpoint. Returns true when cleared or unused.
+ * Retry a failed post-hand escrow checkpoint (including any still-pending leaves).
+ * Returns true when cleared or unused.
  */
 function retryEscrowCheckpointIfNeeded(
   state: GameState,
+  dispatcher: nkruntime.MatchDispatcher,
   nk: nkruntime.Nakama,
   logger: nkruntime.Logger
 ): boolean {
   if (!state.escrowCheckpointFailed) {
     return true;
+  }
+
+  const hadPending = Object.values(state.players).some((p) => p.pendingLeave);
+  if (hadPending) {
+    settlePendingLeaves(state, dispatcher, nk, logger, true);
+    return !state.escrowCheckpointFailed;
   }
 
   const remaining = Object.entries(state.players);
@@ -934,7 +999,26 @@ function recordHandBookkeeping(
     try {
       recordHandStatistics(nk, entry.odid, netChange, wonHand, logger);
     } catch (e) {
-      logger.warn('Failed to record hand statistics', { userId: entry.odid, error: e });
+      logger.warn('Failed to record hand statistics; queueing for retry', {
+        userId: entry.odid,
+        error: e,
+      });
+      try {
+        enqueuePendingHandStatistics(
+          nk,
+          state.matchId,
+          state.handNumber,
+          entry.odid,
+          netChange,
+          wonHand,
+          logger
+        );
+      } catch (enqueueError) {
+        logger.error('Failed to persist pending hand statistics after record failure', {
+          userId: entry.odid,
+          error: enqueueError,
+        });
+      }
     }
   });
 }
@@ -1046,11 +1130,20 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
   // Retry cash-outs that previously failed persistence (only pendingLeave seats)
   if (state.phase === GamePhase.Waiting) {
     const hadPending = Object.values(state.players).some((p) => p.pendingLeave);
-    if (hadPending) {
+    if (hadPending && !state.escrowCheckpointFailed) {
       settlePendingLeaves(state, dispatcher, nk, logger, false);
       if (Object.keys(state.players).length === 0 && Object.keys(state.spectators).length === 0) {
         logger.info('No players or spectators left after pending settlement, ending match');
         return null;
+      }
+    }
+
+    // Retry any durable pending hand-stat updates for seated users
+    for (const userId of Object.keys(state.players)) {
+      try {
+        flushPendingHandStatistics(nk, userId, logger);
+      } catch (e) {
+        logger.warn('Failed flushing pending hand statistics', { userId, error: e });
       }
     }
   }
@@ -1115,7 +1208,7 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
   switch (state.phase) {
     case GamePhase.Waiting:
       // Fail-closed: do not start a new hand until post-hand escrow is checkpointed
-      if (!retryEscrowCheckpointIfNeeded(state, nk, logger)) {
+      if (!retryEscrowCheckpointIfNeeded(state, dispatcher, nk, logger)) {
         break;
       }
 
