@@ -5,7 +5,7 @@
 
 import { pokerMatchHandler } from './poker/match_handler';
 import { findMatchRpc, createPrivateMatchRpc, listRoomsRpc } from './rpc/find_match';
-import { getChipsRpc, updateChipsRpc, claimDailyRewardRpc, getLeaderboardRpc } from './rpc/user_chips';
+import { getChipsRpc, claimDailyRewardRpc, getLeaderboardRpc } from './rpc/user_chips';
 
 // Module name for the poker match handler
 const POKER_MATCH_MODULE = 'poker';
@@ -26,9 +26,8 @@ function InitModule(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nkrunt
   initializer.registerRpc('list_rooms', listRoomsRpc);
   logger.info('Registered match RPC functions');
 
-  // Register user chips RPC functions
+  // Register user chips RPC functions (updateUserChips is internal-only — not client-callable)
   initializer.registerRpc('get_chips', getChipsRpc);
-  initializer.registerRpc('update_chips', updateChipsRpc);
   initializer.registerRpc('claim_daily_reward', claimDailyRewardRpc);
   initializer.registerRpc('get_leaderboard', getLeaderboardRpc);
   logger.info('Registered user chips RPC functions');
