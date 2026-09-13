@@ -250,14 +250,12 @@ export function useNakama() {
       }
 
       case OpCode.SPECTATOR_JOINED: {
-        const spectatorData = data as ServerSpectatorJoinedData & {
-          youAreSpectator?: boolean
-        }
+        const spectatorData = data as ServerSpectatorJoinedData
         const { userId } = useGameStore.getState()
         console.log('Spectator joined:', spectatorData.displayName)
         addSpectator({ id: spectatorData.odid, name: spectatorData.displayName })
-        // Explicit role update when buy-in fails or server seats us as spectator
-        if (spectatorData.odid === userId || spectatorData.youAreSpectator) {
+        // Role applies only to the affected presence — never trust broadcast-wide flags
+        if (spectatorData.odid === userId) {
           setIsSpectator(true)
           addChatMessage('system', 'System', 'You are spectating this table')
         } else {

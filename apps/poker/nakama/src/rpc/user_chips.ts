@@ -65,6 +65,10 @@ export interface MatchEscrowRecord {
   updatedAt: number;
 }
 
+export type MatchLiveness = 'alive' | 'dead' | 'unknown';
+
+export const POKER_LEADERBOARD_ID = 'poker_total_won';
+
 function isVersionConflict(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   const lower = message.toLowerCase();
@@ -240,48 +244,76 @@ export function writeMatchEscrow(
   amount: number,
   logger: nkruntime.Logger
 ): void {
-  if (!matchId || !userId) {
+  writeMatchEscrowBatch(nk, matchId, [{ userId, amount }], logger);
+}
+
+/**
+ * Persist a full post-hand escrow checkpoint for every seated player in one
+ * storageWrite so a mid-loop crash cannot leave mixed pre/post-hand amounts.
+ */
+export function writeMatchEscrowBatch(
+  nk: nkruntime.Nakama,
+  matchId: string,
+  entries: { userId: string; amount: number }[],
+  logger: nkruntime.Logger
+): void {
+  if (!matchId || entries.length === 0) {
     return;
   }
-  const credit = Math.max(0, Math.floor(amount));
+
   const now = Date.now();
-  const existing = nk.storageRead([
-    {
-      collection: ESCROW_COLLECTION,
-      key: escrowKey(matchId),
-      userId,
-    },
-  ]);
-
-  const previous =
-    existing.length > 0 && existing[0].value
-      ? (existing[0].value as MatchEscrowRecord)
-      : null;
-
-  const record: MatchEscrowRecord = {
-    matchId,
-    userId,
-    amount: credit,
-    status: 'active',
-    createdAt: previous?.createdAt || now,
-    updatedAt: now,
-  };
-
-  try {
-    nk.storageWrite([
-      {
+  const reads = nk.storageRead(
+    entries
+      .filter((entry) => !!entry.userId)
+      .map((entry) => ({
         collection: ESCROW_COLLECTION,
         key: escrowKey(matchId),
-        userId,
+        userId: entry.userId,
+      }))
+  );
+  const previousByUser = new Map<string, MatchEscrowRecord>();
+  for (const obj of reads) {
+    if (obj.value) {
+      previousByUser.set(obj.userId, obj.value as MatchEscrowRecord);
+    }
+  }
+
+  const writes = entries
+    .filter((entry) => !!entry.userId)
+    .map((entry) => {
+      const credit = Math.max(0, Math.floor(entry.amount));
+      const previous = previousByUser.get(entry.userId) || null;
+      const record: MatchEscrowRecord = {
+        matchId,
+        userId: entry.userId,
+        amount: credit,
+        status: 'active',
+        createdAt: previous?.createdAt || now,
+        updatedAt: now,
+      };
+      return {
+        collection: ESCROW_COLLECTION,
+        key: escrowKey(matchId),
+        userId: entry.userId,
         value: record,
         permissionRead: 1,
         permissionWrite: 0,
-        // Unconditional write — escrow is a recovery snapshot, not a balance source of truth
-      },
-    ]);
-    logger.info(`Wrote match escrow for ${userId} in ${matchId}: ${credit}`);
+      };
+    });
+
+  if (writes.length === 0) {
+    return;
+  }
+
+  try {
+    nk.storageWrite(writes as nkruntime.StorageWriteRequest[]);
+    logger.info(
+      `Wrote match escrow batch for ${matchId}: ${writes
+        .map((w) => `${w.userId}=${(w.value as MatchEscrowRecord).amount}`)
+        .join(',')}`
+    );
   } catch (e) {
-    logger.error(`Failed to write match escrow for ${userId} in ${matchId}: ${e}`);
+    logger.error(`Failed to write match escrow batch for ${matchId}: ${e}`);
     throw e;
   }
 }
@@ -391,13 +423,112 @@ export function debitBuyInWithEscrow(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-function isMatchAlive(nk: nkruntime.Nakama, matchId: string): boolean {
+/**
+ * Distinguish a successful null matchGet (dead) from a transient lookup error.
+ * Unknown liveness must not trigger escrow refunds.
+ */
+export function getMatchLiveness(
+  nk: nkruntime.Nakama,
+  matchId: string
+): MatchLiveness {
   try {
     const match = nk.matchGet(matchId);
-    return !!match;
+    return match ? 'alive' : 'dead';
   } catch {
-    return false;
+    return 'unknown';
   }
+}
+
+/**
+ * Atomically credit wallet and claim escrow (status -> settled) with OCC versions.
+ * Only one concurrent reconciler can win the escrow version race.
+ */
+function claimOrphanedEscrowRefund(
+  nk: nkruntime.Nakama,
+  userId: string,
+  matchId: string,
+  escrowVersion: string,
+  amount: number,
+  logger: nkruntime.Logger
+): number {
+  const credit = Math.max(0, Math.floor(amount));
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= WALLET_WRITE_MAX_ATTEMPTS; attempt++) {
+    try {
+      // Re-read escrow — may already be claimed by a concurrent reconciler
+      const escrowObjects = nk.storageRead([
+        {
+          collection: ESCROW_COLLECTION,
+          key: escrowKey(matchId),
+          userId,
+        },
+      ]);
+      if (escrowObjects.length === 0 || !escrowObjects[0].value) {
+        return 0;
+      }
+      const current = escrowObjects[0].value as MatchEscrowRecord;
+      if (current.status !== 'active') {
+        return 0;
+      }
+      const version = escrowObjects[0].version || escrowVersion;
+      const claimAmount = Math.max(0, Math.floor(current.amount || credit));
+
+      const stored = getUserChips(nk, userId, logger);
+      const previousBalance = stored.data.balance;
+      const nextWallet: UserChipsData = {
+        ...stored.data,
+        balance: previousBalance + claimAmount,
+      };
+      nextWallet.lastUpdated = Date.now();
+
+      const settled: MatchEscrowRecord = {
+        ...current,
+        status: 'settled',
+        updatedAt: Date.now(),
+      };
+
+      // Single multi-object write: wallet credit + escrow claim succeed or fail together
+      nk.storageWrite([
+        {
+          collection: CHIPS_COLLECTION,
+          key: CHIPS_KEY,
+          userId,
+          value: nextWallet,
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: stored.version,
+        },
+        {
+          collection: ESCROW_COLLECTION,
+          key: escrowKey(matchId),
+          userId,
+          value: settled,
+          permissionRead: 1,
+          permissionWrite: 0,
+          version,
+        },
+      ]);
+
+      // Best-effort cleanup of the settled claim marker
+      clearMatchEscrow(nk, matchId, userId, logger);
+
+      logger.info(
+        `Reconciled orphaned escrow for ${userId} match ${matchId}: +${claimAmount} (${previousBalance} -> ${nextWallet.balance})`
+      );
+      return claimAmount;
+    } catch (e) {
+      lastError = e;
+      if (!isVersionConflict(e) || attempt === WALLET_WRITE_MAX_ATTEMPTS) {
+        throw e;
+      }
+      logger.warn(
+        `Orphaned escrow claim conflict for ${userId} match ${matchId}, retrying (${attempt}/${WALLET_WRITE_MAX_ATTEMPTS})`
+      );
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 /**
@@ -431,26 +562,33 @@ export function reconcileOrphanedEscrows(
       if (!record || record.status !== 'active' || !record.matchId) {
         continue;
       }
-      if (isMatchAlive(nk, record.matchId)) {
+
+      const liveness = getMatchLiveness(nk, record.matchId);
+      if (liveness === 'alive') {
+        continue;
+      }
+      if (liveness === 'unknown') {
+        logger.warn(
+          `Skipping escrow reconcile for ${userId} match ${record.matchId}: match liveness unknown`
+        );
         continue;
       }
 
       const amount = Math.max(0, Math.floor(record.amount || 0));
-      if (amount > 0) {
-        try {
-          creditCashOut(nk, userId, amount, logger);
-          refunded += amount;
-          logger.info(
-            `Reconciled orphaned escrow for ${userId} match ${record.matchId}: +${amount}`
-          );
-        } catch (e) {
-          logger.error(
-            `Failed to credit orphaned escrow for ${userId} match ${record.matchId}: ${e}`
-          );
-          continue;
-        }
+      try {
+        refunded += claimOrphanedEscrowRefund(
+          nk,
+          userId,
+          record.matchId,
+          obj.version || '*',
+          amount,
+          logger
+        );
+      } catch (e) {
+        logger.error(
+          `Failed to claim orphaned escrow for ${userId} match ${record.matchId}: ${e}`
+        );
       }
-      clearMatchEscrow(nk, record.matchId, userId, logger);
     }
 
     cursor = listed.cursor || undefined;
@@ -740,26 +878,11 @@ export const getLeaderboardRpc: nkruntime.RpcFunction = (
     // Use default limit
   }
 
-  // Use Nakama leaderboard for rankings
-  const LEADERBOARD_ID = 'poker_total_won';
-
-  // Ensure leaderboard exists
-  try {
-    nk.leaderboardCreate(
-      LEADERBOARD_ID,
-      true, // authoritative
-      nkruntime.SortOrder.DESCENDING, // highest score wins
-      nkruntime.Operator.SET, // set score directly
-      null, // never reset
-      undefined // metadata
-    );
-  } catch {
-    // Leaderboard already exists
-  }
+  ensurePokerLeaderboard(nk, logger);
 
   // Get leaderboard records
   const result = nk.leaderboardRecordsList(
-    LEADERBOARD_ID,
+    POKER_LEADERBOARD_ID,
     [], // owner IDs (empty = all)
     limit,
     undefined, // cursor
@@ -777,6 +900,31 @@ export const getLeaderboardRpc: nkruntime.RpcFunction = (
 };
 
 /**
+ * Ensure the career leaderboard exists (safe to call repeatedly).
+ */
+export function ensurePokerLeaderboard(
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger
+): void {
+  try {
+    // Use string literals — nkruntime.SortOrder/Operator enums are runtime globals
+    // in Nakama but undefined under vitest, which would silently skip create.
+    nk.leaderboardCreate(
+      POKER_LEADERBOARD_ID,
+      true, // authoritative
+      'descending' as unknown as nkruntime.SortOrder,
+      'set' as unknown as nkruntime.Operator,
+      null, // never reset
+      undefined // metadata
+    );
+    logger.info(`Ensured leaderboard ${POKER_LEADERBOARD_ID}`);
+  } catch (e) {
+    // Leaderboard already exists (or create is idempotent-conflict)
+    logger.debug(`Leaderboard ensure note for ${POKER_LEADERBOARD_ID}: ${e}`);
+  }
+}
+
+/**
  * Update leaderboard score (called after winning)
  */
 export function updateLeaderboardScore(
@@ -785,11 +933,11 @@ export function updateLeaderboardScore(
   totalWon: number,
   logger: nkruntime.Logger
 ): void {
-  const LEADERBOARD_ID = 'poker_total_won';
+  ensurePokerLeaderboard(nk, logger);
 
   try {
     nk.leaderboardRecordWrite(
-      LEADERBOARD_ID,
+      POKER_LEADERBOARD_ID,
       userId,
       undefined, // username (will use account username)
       totalWon,

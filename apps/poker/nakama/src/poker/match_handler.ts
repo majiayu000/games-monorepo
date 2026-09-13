@@ -29,7 +29,7 @@ import {
   debitBuyInWithEscrow,
   getWalletBalance,
   recordHandStatistics,
-  writeMatchEscrow,
+  writeMatchEscrowBatch,
 } from '../rpc/user_chips';
 
 // Match tick rate (10 ticks per second)
@@ -462,10 +462,10 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
         joinedAt: tick,
       };
       state.spectators[presence.userId] = spectator;
+      // Broadcast join to the match; recipients decide self-role from odid only.
       broadcastMessage(dispatcher, OpCode.SPECTATOR_JOINED, {
         odid: presence.userId,
         displayName: spectator.displayName,
-        youAreSpectator: true,
         reason: 'buyin_failed',
       });
       sendMessage(dispatcher, OpCode.ERROR, {
@@ -820,57 +820,83 @@ function settlePendingLeaves(
   }
 
   if (syncEscrowForRemaining) {
-    Object.entries(state.players).forEach(([userId, player]) => {
+    const remaining = Object.entries(state.players);
+    for (const [, player] of remaining) {
       // After a hand, committed bets are already reflected in chips (or gone to winners).
       // Do not add totalBetThisHand — that double-counts fold-win stacks.
       player.totalBetThisHand = 0;
       player.currentBet = 0;
-      writeMatchEscrow(
-        nk,
-        state.matchId,
-        userId,
-        player.chips,
-        logger
-      );
-    });
+    }
+    // Atomic multi-object checkpoint — avoids mixed pre/post-hand escrow on crash.
+    writeMatchEscrowBatch(
+      nk,
+      state.matchId,
+      remaining.map(([userId, player]) => ({ userId, amount: player.chips })),
+      logger
+    );
   }
 
   updateMatchLabel(state, dispatcher);
 }
 
+interface HandContributionSnapshot {
+  odid: string;
+  contributed: number;
+  status: PlayerStatus;
+}
+
+/**
+ * Capture per-player hand contributions/statuses before showdown reset.
+ */
+function snapshotHandContributions(state: GameState): HandContributionSnapshot[] {
+  return Object.values(state.players).map((player) => ({
+    odid: player.odid,
+    contributed: player.totalBetThisHand || 0,
+    status: player.status,
+  }));
+}
+
 /**
  * Persist career hand stats / leaderboard from authoritative hand results.
- * Must run before totalBetThisHand is cleared by escrow sync.
+ * Prefer a pre-showdown snapshot — executeShowdown clears totalBetThisHand/status.
  */
 function recordHandBookkeeping(
   state: GameState,
   nk: nkruntime.Nakama,
   logger: nkruntime.Logger,
-  winners: { odid: string; amount: number }[]
+  winners: { odid: string; amount: number }[],
+  contributions?: HandContributionSnapshot[]
 ): void {
   const winnerIds = new Set(winners.map((w) => w.odid));
   const winnerAmounts = new Map(winners.map((w) => [w.odid, w.amount]));
+  const participants =
+    contributions ||
+    Object.values(state.players).map((player) => ({
+      odid: player.odid,
+      contributed: player.totalBetThisHand || 0,
+      status: player.status,
+    }));
 
-  Object.values(state.players).forEach((player) => {
-    const contributed = player.totalBetThisHand || 0;
-    const wonHand = winnerIds.has(player.odid);
+  participants.forEach((entry) => {
+    const contributed = entry.contributed || 0;
+    const wonHand = winnerIds.has(entry.odid);
     const wasInHand =
       contributed > 0 ||
       wonHand ||
-      player.status === PlayerStatus.Folded ||
-      player.status === PlayerStatus.Active ||
-      player.status === PlayerStatus.AllIn;
+      entry.status === PlayerStatus.Folded ||
+      entry.status === PlayerStatus.Active ||
+      entry.status === PlayerStatus.AllIn;
 
     if (!wasInHand) {
       return;
     }
 
-    const winAmount = winnerAmounts.get(player.odid) || 0;
+    const winAmount = winnerAmounts.get(entry.odid) || 0;
     const netChange = winAmount - contributed;
     try {
-      recordHandStatistics(nk, player.odid, netChange, wonHand, logger);
+      recordHandStatistics(nk, entry.odid, netChange, wonHand, logger);
     } catch (e) {
-      logger.warn('Failed to record hand statistics', { userId: player.odid, error: e });
+      logger.warn('Failed to record hand statistics', { userId: entry.odid, error: e });
     }
   });
 }
@@ -1115,6 +1141,9 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       break;
 
     case GamePhase.Showdown:
+      // Snapshot contributions before executeShowdown clears them
+      const showdownContributions = snapshotHandContributions(state);
+
       // Execute showdown and determine winners
       const showdownResult = executeShowdown(state, logger);
 
@@ -1133,7 +1162,13 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       state.phase = GamePhase.Waiting;
 
       // Cash out disconnect/leave players and refresh escrow for remaining seats
-      recordHandBookkeeping(state, nk, logger, showdownResult.winners);
+      recordHandBookkeeping(
+        state,
+        nk,
+        logger,
+        showdownResult.winners,
+        showdownContributions
+      );
       settlePendingLeaves(state, dispatcher, nk, logger, true);
 
       // Broadcast updated game state

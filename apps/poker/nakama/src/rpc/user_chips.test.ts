@@ -10,12 +10,14 @@ import {
   creditCashOut,
   debitBuyIn,
   debitBuyInWithEscrow,
+  ensurePokerLeaderboard,
   getChipsRpc,
   getWalletBalance,
   reconcileOrphanedEscrows,
   recordHandStatistics,
   updateChipsRpc,
   writeMatchEscrow,
+  writeMatchEscrowBatch,
   MIN_BUY_IN,
   MAX_STARTING_CHIPS,
   DEFAULT_STARTING_CHIPS,
@@ -43,12 +45,15 @@ function createMockNk(
   options: {
     failWritesUntil?: number;
     matchesAlive?: Record<string, boolean>;
+    matchGetThrows?: Record<string, boolean>;
   } = {}
-): nkruntime.Nakama {
+): nkruntime.Nakama & { __leaderboardCreates: string[] } {
   const store = new Map<string, StoredObject>();
   let writeCount = 0;
   const failWritesUntil = options.failWritesUntil ?? 0;
   const matchesAlive = options.matchesAlive ?? {};
+  const matchGetThrows = options.matchGetThrows ?? {};
+  const leaderboardCreates: string[] = [];
 
   for (const [userId, balance] of Object.entries(initialByUser)) {
     store.set(`${userId}:user_data:chips`, {
@@ -69,6 +74,7 @@ function createMockNk(
   }
 
   return {
+    __leaderboardCreates: leaderboardCreates,
     storageRead: (queries: { collection: string; key: string; userId: string }[]) => {
       return queries
         .map((q) => store.get(`${q.userId}:${q.collection}:${q.key}`))
@@ -160,13 +166,19 @@ function createMockNk(
       };
     },
     matchGet: (matchId: string) => {
+      if (matchGetThrows[matchId]) {
+        throw new Error('transient matchGet failure');
+      }
       if (matchesAlive[matchId]) {
         return { matchId } as nkruntime.Match;
       }
       return null;
     },
+    leaderboardCreate: (id: string) => {
+      leaderboardCreates.push(id);
+    },
     leaderboardRecordWrite: () => undefined,
-  } as unknown as nkruntime.Nakama;
+  } as unknown as nkruntime.Nakama & { __leaderboardCreates: string[] };
 }
 
 describe('clampStartingChips', () => {
@@ -311,6 +323,65 @@ describe('match escrow', () => {
     const refunded = reconcileOrphanedEscrows(nk, 'user1', logger);
     expect(refunded).toBe(0);
     expect(getWalletBalance(nk, 'user1', logger)).toBe(4000);
+  });
+
+  it('skips reconcile when matchGet throws (liveness unknown)', () => {
+    const nk = createMockNk(
+      { user1: 4000 },
+      { matchesAlive: {}, matchGetThrows: { 'maybe-live': true } }
+    );
+    writeMatchEscrow(nk, 'maybe-live', 'user1', 1000, logger);
+
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger);
+    expect(refunded).toBe(0);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(4000);
+
+    const stillThere = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: 'escrow:maybe-live', userId: 'user1' },
+    ]);
+    expect(stillThere).toHaveLength(1);
+    expect(stillThere[0].value.status).toBe('active');
+  });
+
+  it('refunds orphaned escrow only once across concurrent reconciles', () => {
+    const nk = createMockNk({ user1: 4000 }, { matchesAlive: {} });
+    writeMatchEscrow(nk, 'dead-match', 'user1', 1000, logger);
+
+    const first = reconcileOrphanedEscrows(nk, 'user1', logger);
+    const second = reconcileOrphanedEscrows(nk, 'user1', logger);
+    expect(first).toBe(1000);
+    expect(second).toBe(0);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
+  });
+
+  it('checkpoints multiple player escrows in one atomic batch', () => {
+    const nk = createMockNk({ user1: 5000, user2: 5000 });
+    writeMatchEscrowBatch(
+      nk,
+      'match-batch',
+      [
+        { userId: 'user1', amount: 1100 },
+        { userId: 'user2', amount: 900 },
+      ],
+      logger
+    );
+
+    const objects = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: 'escrow:match-batch', userId: 'user1' },
+      { collection: 'match_escrow', key: 'escrow:match-batch', userId: 'user2' },
+    ]);
+    expect(objects).toHaveLength(2);
+    expect(objects.find((o: StoredObject) => o.userId === 'user1').value.amount).toBe(1100);
+    expect(objects.find((o: StoredObject) => o.userId === 'user2').value.amount).toBe(900);
+  });
+});
+
+describe('ensurePokerLeaderboard', () => {
+  it('creates poker_total_won on initialization path', () => {
+    const nk = createMockNk();
+    const logger = createLogger();
+    ensurePokerLeaderboard(nk, logger);
+    expect(nk.__leaderboardCreates).toContain('poker_total_won');
   });
 });
 
