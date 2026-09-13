@@ -925,7 +925,7 @@ export interface GameInvite {
   maxPlayers: number;         // 房间最大人数
   createdAt: number;          // 创建时间戳
   expiresAt: number;          // 过期时间戳
-  password?: string;          // 私密房间密码（仅发送给被邀请者）
+  password?: string;          // 私密房间密码（仅 accept 时返回；勿写入 owner-readable storage）
 }
 
 /** 创建邀请请求 */
@@ -970,6 +970,8 @@ export const INVITE_CONFIG = {
   STORAGE_COLLECTION: 'werewolf_invites',
   STORAGE_KEY_SENT: 'sent_invites',
   STORAGE_KEY_RECEIVED: 'received_invites',
+  /** Server-only secrets keyed by inviteId (permissionRead/Write = 0). */
+  STORAGE_COLLECTION_SECRETS: 'werewolf_invite_secrets',
 };
 
 // ============================================================================

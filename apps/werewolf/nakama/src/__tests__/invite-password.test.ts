@@ -1,5 +1,5 @@
 /**
- * Invite password retrieval via matchSignal
+ * Invite password retrieval via matchSignal + server-only secret storage
  */
 
 import { describe, it, expect, beforeEach } from 'bun:test';
@@ -7,9 +7,13 @@ import {
   authorizeAndGetMatchPassword,
   buildGetPasswordSignal,
   handleMatchSignalPayload,
+  inviteForOwnerStorage,
+  INVITE_SECRET_PERMISSION_READ,
+  INVITE_SECRET_PERMISSION_WRITE,
   parsePasswordFromMatchSignal,
   MATCH_SIGNAL_GET_PASSWORD,
 } from '../werewolf/invite-password';
+import { GameInvite, InviteStatus, INVITE_CONFIG } from '../werewolf/types';
 import { createTestGameState, createTestPlayer, resetPlayerIdCounter } from './test-utils';
 
 describe('matchSignal password retrieval', () => {
@@ -87,7 +91,36 @@ describe('invite password attachment from matchSignal', () => {
     expect(parsePasswordFromMatchSignal('')).toBeUndefined();
   });
 
-  it('end-to-end: private match signal response attaches usable invite password', () => {
+  it('inviteForOwnerStorage strips password from owner-readable invite records', () => {
+    const invite: GameInvite = {
+      inviteId: 'inv-1',
+      matchId: 'match-1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: 2,
+      password: 'must-not-persist',
+    };
+
+    const stored = inviteForOwnerStorage(invite);
+    expect(stored.password).toBeUndefined();
+    expect(stored.inviteId).toBe('inv-1');
+    expect(invite.password).toBe('must-not-persist'); // original unchanged
+  });
+
+  it('server-only secret ACL is not owner-readable', () => {
+    expect(INVITE_SECRET_PERMISSION_READ).toBe(0);
+    expect(INVITE_SECRET_PERMISSION_WRITE).toBe(0);
+    expect(INVITE_CONFIG.STORAGE_COLLECTION_SECRETS).toBe('werewolf_invite_secrets');
+  });
+
+  it('end-to-end: password stays server-only until accept', () => {
     const host = createTestPlayer({ oderId: 'host-1' });
     const state = createTestGameState({
       password: 'invite-secret',
@@ -101,15 +134,40 @@ describe('invite password attachment from matchSignal', () => {
 
     const signalResponse = handleMatchSignalPayload(state, buildGetPasswordSignal(host.oderId));
     const invitePassword = parsePasswordFromMatchSignal(signalResponse);
-
     expect(invitePassword).toBe('invite-secret');
 
-    // Accept path returns stored invite password (respond_invite behavior)
+    // Owner-readable invite copy must not include the password
+    const ownerInvite = inviteForOwnerStorage({
+      inviteId: 'inv-e2e',
+      matchId: state.matchId,
+      roomName: state.roomName,
+      senderId: host.oderId,
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      password: invitePassword,
+    });
+    expect(ownerInvite.password).toBeUndefined();
+
+    // Server-only secret store (simulated) holds the password until accept
+    const secretStore: Record<string, { password: string }> = {
+      'inv-e2e': { password: invitePassword! },
+    };
+
+    // Accept path returns password from server-only store, not from owner storage
+    const acceptPassword = secretStore['inv-e2e']?.password;
+    delete secretStore['inv-e2e'];
     const acceptPayload = {
       success: true,
       matchId: state.matchId,
-      password: invitePassword,
+      password: acceptPassword,
     };
     expect(acceptPayload.password).toBe('invite-secret');
+    expect(secretStore['inv-e2e']).toBeUndefined();
   });
 });

@@ -1,12 +1,26 @@
 /**
  * Private-room invite password helpers.
  * Password stays out of the public match label; authorized match players
- * retrieve it via matchSignal when sending invites.
+ * retrieve it via matchSignal when sending invites. The secret is then kept
+ * in server-only storage (never owner-readable invite records) until accept.
  */
 
-import { GameState } from './types';
+import { GameInvite, GameState } from './types';
 
 export const MATCH_SIGNAL_GET_PASSWORD = 'get_password';
+
+/** Nakama storage ACL: no client reads (server RPCs only). */
+export const INVITE_SECRET_PERMISSION_READ = 0;
+/** Nakama storage ACL: no client writes (server RPCs only). */
+export const INVITE_SECRET_PERMISSION_WRITE = 0;
+
+/**
+ * Strip password before writing invites to owner-readable storage.
+ */
+export function inviteForOwnerStorage(invite: GameInvite): GameInvite {
+  const { password: _omit, ...rest } = invite;
+  return rest;
+}
 
 export interface GetPasswordSignalRequest {
   action: typeof MATCH_SIGNAL_GET_PASSWORD;

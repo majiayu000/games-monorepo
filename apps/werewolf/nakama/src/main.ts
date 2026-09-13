@@ -29,6 +29,9 @@ import {
 } from './werewolf/replay';
 import {
   buildGetPasswordSignal,
+  inviteForOwnerStorage,
+  INVITE_SECRET_PERMISSION_READ,
+  INVITE_SECRET_PERMISSION_WRITE,
   parsePasswordFromMatchSignal,
 } from './werewolf/invite-password';
 
@@ -730,10 +733,11 @@ function rpcSendInvite(
       }
     }
 
-    // Create invite
+    // Create invite (password stays out of owner-readable invite storage)
     const now = Date.now();
+    const inviteId = generateInviteId();
     const invite: GameInvite = {
-      inviteId: generateInviteId(),
+      inviteId,
       matchId,
       roomName: matchLabel.roomName || `房间 ${matchId.slice(-6)}`,
       senderId: ctx.userId,
@@ -745,8 +749,11 @@ function rpcSendInvite(
       maxPlayers: matchLabel.maxPlayers || 12,
       createdAt: now,
       expiresAt: now + INVITE_CONFIG.EXPIRE_TIME,
-      password: invitePassword,
     };
+
+    if (invitePassword) {
+      writeInvitePasswordSecret(nk, inviteId, ctx.userId, invitePassword);
+    }
 
     // Store invite for sender (sent invites)
     const senderInvites = readInvites(nk, ctx.userId, 'sent');
@@ -764,10 +771,7 @@ function rpcSendInvite(
       subject: 'game_invite',
       content: {
         type: 'game_invite',
-        invite: {
-          ...invite,
-          password: undefined, // Don't include password in notification
-        },
+        invite,
       },
       code: 81, // OpCode.INVITE_RECEIVED
       persistent: true,
@@ -814,12 +818,9 @@ function rpcGetInvites(
         invite.status = InviteStatus.EXPIRED;
         hasExpired = true;
       }
-      // Only return pending invites by default
+      // Only return pending invites by default (password never in owner storage)
       if (invite.status === InviteStatus.PENDING) {
-        validInvites.push({
-          ...invite,
-          password: undefined, // Don't expose password in list
-        });
+        validInvites.push(inviteForOwnerStorage(invite));
       }
     }
 
@@ -895,6 +896,7 @@ function rpcRespondInvite(
     if (invite.expiresAt < now) {
       invite.status = InviteStatus.EXPIRED;
       writeInvites(nk, ctx.userId, 'received', invites);
+      deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
       return JSON.stringify({
         success: false,
         error: 'Invite has expired',
@@ -913,6 +915,12 @@ function rpcRespondInvite(
       senderInvites[senderInviteIndex].status = newStatus;
       writeInvites(nk, invite.senderId, 'sent', senderInvites);
     }
+
+    // Password is server-only until accept; always clear the secret after respond
+    const password = accept
+      ? readInvitePasswordSecret(nk, invite.inviteId, invite.senderId)
+      : undefined;
+    deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
 
     // Notify sender about the response
     const notificationCode = accept ? 82 : 83; // INVITE_ACCEPTED or INVITE_DECLINED
@@ -937,7 +945,7 @@ function rpcRespondInvite(
       return JSON.stringify({
         success: true,
         matchId: invite.matchId,
-        password: invite.password, // Return password for private rooms
+        password, // From server-only secret store for private rooms
       });
     }
 
@@ -1004,6 +1012,7 @@ function rpcCancelInvite(
     // Update invite status
     invite.status = InviteStatus.CANCELLED;
     writeInvites(nk, ctx.userId, 'sent', invites);
+    deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
 
     // Update receiver's copy
     const receiverInvites = readInvites(nk, invite.receiverId, 'received');
@@ -1069,7 +1078,7 @@ function readInvites(
 }
 
 /**
- * Helper: Write invites to storage
+ * Helper: Write invites to storage (never persist passwords — owner-readable ACL).
  */
 function writeInvites(
   nk: nkruntime.Nakama,
@@ -1079,8 +1088,8 @@ function writeInvites(
 ): void {
   const key = type === 'sent' ? INVITE_CONFIG.STORAGE_KEY_SENT : INVITE_CONFIG.STORAGE_KEY_RECEIVED;
 
-  // Clean up old invites (keep last 50)
-  const recentInvites = invites.slice(-50);
+  // Clean up old invites (keep last 50); strip passwords so storage API cannot leak them
+  const recentInvites = invites.slice(-50).map(inviteForOwnerStorage);
 
   nk.storageWrite([{
     collection: INVITE_CONFIG.STORAGE_COLLECTION,
@@ -1090,6 +1099,64 @@ function writeInvites(
     permissionRead: 1, // Owner only
     permissionWrite: 0, // Server only
   }]);
+}
+
+/**
+ * Server-only invite password (permissionRead/Write = 0 — not readable via client storage API).
+ */
+function writeInvitePasswordSecret(
+  nk: nkruntime.Nakama,
+  inviteId: string,
+  ownerUserId: string,
+  password: string
+): void {
+  nk.storageWrite([{
+    collection: INVITE_CONFIG.STORAGE_COLLECTION_SECRETS,
+    key: inviteId,
+    userId: ownerUserId,
+    value: { password },
+    permissionRead: INVITE_SECRET_PERMISSION_READ,
+    permissionWrite: INVITE_SECRET_PERMISSION_WRITE,
+  }]);
+}
+
+function readInvitePasswordSecret(
+  nk: nkruntime.Nakama,
+  inviteId: string,
+  ownerUserId: string
+): string | undefined {
+  try {
+    const objects = nk.storageRead([{
+      collection: INVITE_CONFIG.STORAGE_COLLECTION_SECRETS,
+      key: inviteId,
+      userId: ownerUserId,
+    }]);
+    if (objects.length > 0 && objects[0].value) {
+      const password = (objects[0].value as { password?: unknown }).password;
+      if (typeof password === 'string' && password.length > 0) {
+        return password;
+      }
+    }
+  } catch {
+    // Missing secret → treat as no password
+  }
+  return undefined;
+}
+
+function deleteInvitePasswordSecret(
+  nk: nkruntime.Nakama,
+  inviteId: string,
+  ownerUserId: string
+): void {
+  try {
+    nk.storageDelete([{
+      collection: INVITE_CONFIG.STORAGE_COLLECTION_SECRETS,
+      key: inviteId,
+      userId: ownerUserId,
+    }]);
+  } catch {
+    // Ignore missing secret
+  }
 }
 
 // ============================================================================
