@@ -312,9 +312,12 @@ export const PRESET_CONFIGS: Record<number, Role[]> = {
   ],
 };
 
+/** Server-enforced minimum players for a rewardable match (smallest preset). */
+export const SERVER_MIN_PLAYERS = 6;
+
 /** 默认游戏配置 */
 export const DEFAULT_GAME_CONFIG: GameConfig = {
-  minPlayers: 6,
+  minPlayers: SERVER_MIN_PLAYERS,
   maxPlayers: 18,
   roles: PRESET_CONFIGS[9],
   discussionTime: 120,     // 2分钟讨论

@@ -19,6 +19,7 @@ import {
   VoteRecord,
   DEFAULT_GAME_CONFIG,
   PRESET_CONFIGS,
+  SERVER_MIN_PLAYERS,
   getRoleFaction,
   isWerewolf,
   PlayerExtendedState,
@@ -109,8 +110,18 @@ function createInitialState(matchId: string, params: { [key: string]: string }):
   };
 
   // Parse custom settings from params
-  if (params.minPlayers) config.minPlayers = parseInt(params.minPlayers);
-  if (params.maxPlayers) config.maxPlayers = parseInt(params.maxPlayers);
+  if (params.minPlayers) {
+    const parsed = parseInt(params.minPlayers, 10);
+    if (!Number.isNaN(parsed)) config.minPlayers = parsed;
+  }
+  if (params.maxPlayers) {
+    const parsed = parseInt(params.maxPlayers, 10);
+    if (!Number.isNaN(parsed)) config.maxPlayers = parsed;
+  }
+  // Clients must not lower the server floor (blocks minPlayers=1 instant-win farms).
+  config.minPlayers = Math.max(SERVER_MIN_PLAYERS, config.minPlayers);
+  config.maxPlayers = Math.max(config.minPlayers, config.maxPlayers);
+
   if (params.discussionTime) config.discussionTime = parseInt(params.discussionTime);
   if (params.votingTime) config.votingTime = parseInt(params.votingTime);
   if (params.nightActionTime) config.nightActionTime = parseInt(params.nightActionTime);
@@ -118,11 +129,15 @@ function createInitialState(matchId: string, params: { [key: string]: string }):
   if (params.allowSheriff) config.allowSheriff = params.allowSheriff === 'true';
   if (params.allowLastWords) config.allowLastWords = params.allowLastWords === 'true';
 
-  // Parse custom role configuration
+  // Parse custom role configuration — require playable two-faction setup.
   if (params.roles) {
     try {
       const rolesArray = JSON.parse(params.roles);
-      if (Array.isArray(rolesArray) && rolesArray.length > 0) {
+      if (
+        Array.isArray(rolesArray) &&
+        rolesArray.length >= SERVER_MIN_PLAYERS &&
+        isValidFactionComposition(rolesArray as Role[])
+      ) {
         config.roles = rolesArray as Role[];
       }
     } catch {
@@ -371,6 +386,39 @@ function getAliveWerewolves(state: GameState): Player[] {
  */
 function getAliveVillagers(state: GameState): Player[] {
   return getAlivePlayers(state).filter(p => p.role && !isWerewolf(p.role));
+}
+
+/**
+ * Count wolf vs non-wolf roles in a composition.
+ */
+function countFactionRoles(roles: Array<Role | null | undefined>): { wolves: number; others: number } {
+  let wolves = 0;
+  let others = 0;
+  for (const role of roles) {
+    if (!role) continue;
+    if (isWerewolf(role)) wolves++;
+    else others++;
+  }
+  return { wolves, others };
+}
+
+/**
+ * A playable match needs wolves and a villager majority so neither side has already won.
+ */
+function isValidFactionComposition(roles: Array<Role | null | undefined>): boolean {
+  const { wolves, others } = countFactionRoles(roles);
+  return wolves >= 1 && others > wolves;
+}
+
+/**
+ * Progression (XP / stats / achievements) requires a full table and valid factions.
+ */
+function isMatchEligibleForProgression(state: GameState): boolean {
+  const participants = Array.from(state.players.values()).filter(p => !p.isSpectator);
+  if (participants.length < SERVER_MIN_PLAYERS) {
+    return false;
+  }
+  return isValidFactionComposition(participants.map(p => p.role));
 }
 
 /**
@@ -1425,7 +1473,8 @@ function handleReady(
 
   // Check if all players are ready
   const allReady = Array.from(state.players.values()).every(p => p.isReady);
-  const hasMinPlayers = state.players.size >= state.config.minPlayers;
+  const requiredPlayers = Math.max(state.config.minPlayers, SERVER_MIN_PLAYERS);
+  const hasMinPlayers = state.players.size >= requiredPlayers;
 
   if (allReady && hasMinPlayers) {
     startGame(state, dispatcher, logger);
@@ -1776,10 +1825,30 @@ function startGame(
   dispatcher: nkruntime.MatchDispatcher,
   logger: nkruntime.Logger
 ): void {
+  if (state.players.size < SERVER_MIN_PLAYERS) {
+    logger.warn(
+      `Refusing to start match ${state.matchId}: ${state.players.size} players < server minimum ${SERVER_MIN_PLAYERS}`
+    );
+    return;
+  }
+
   logger.info('Starting game');
 
   // Assign roles
   assignRoles(state, logger);
+
+  const assignedRoles = Array.from(state.players.values()).map(p => p.role);
+  if (!isValidFactionComposition(assignedRoles)) {
+    logger.warn(
+      `Refusing to start match ${state.matchId}: invalid faction composition after role assignment`
+    );
+    for (const player of state.players.values()) {
+      player.role = null;
+      player.isReady = false;
+    }
+    state.extendedStates.clear();
+    return;
+  }
 
   // Initialize replay buffer
   const replayBuffer = getReplayBuffer(state.matchId);
@@ -2406,6 +2475,15 @@ function recordGameStats(
   nk: nkruntime.Nakama,
   logger: nkruntime.Logger
 ): void {
+  if (!isMatchEligibleForProgression(state)) {
+    const participants = Array.from(state.players.values()).filter(p => !p.isSpectator);
+    logger.warn(
+      `Skipping progression rewards for match ${state.matchId}: ` +
+      `${participants.length} participants, composition invalid or below server minimum ${SERVER_MIN_PLAYERS}`
+    );
+    return;
+  }
+
   try {
     // Build player data for stats recording
     const playerData = Array.from(state.players.values())

@@ -252,4 +252,21 @@ describe('update_achievements RPC removal', () => {
       /const wasSheriff = player\.oderId === state\.sheriffId;/
     );
   });
+
+  it('clamps minPlayers and skips progression for invalid match composition', async () => {
+    const handlerSource = await Bun.file(
+      new URL('../werewolf/match_handler.ts', import.meta.url)
+    ).text();
+    const typesSource = await Bun.file(
+      new URL('../werewolf/types.ts', import.meta.url)
+    ).text();
+    expect(typesSource).toContain('SERVER_MIN_PLAYERS');
+    expect(handlerSource).toContain('Math.max(SERVER_MIN_PLAYERS, config.minPlayers)');
+    expect(handlerSource).toContain('isMatchEligibleForProgression');
+    expect(handlerSource).toContain('isValidFactionComposition');
+    expect(handlerSource).toContain('Skipping progression rewards for match');
+    expect(handlerSource).toMatch(
+      /if\s*\(\s*!isMatchEligibleForProgression\(state\)\s*\)/
+    );
+  });
 });
