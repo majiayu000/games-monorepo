@@ -299,13 +299,22 @@ const matchJoinAttempt: nkruntime.MatchJoinAttemptFunction<GameState> = function
     if (Object.keys(state.spectators).length >= state.maxSpectators) {
       return { state, accept: false, rejectMessage: 'Spectator limit reached' };
     }
-    // Retain intent for matchJoin — metadata is not forwarded by Nakama
+    // Retain intent for matchJoin — metadata is not forwarded by Nakama.
+    // Bind to sessionId so an abandoned spectator attempt cannot seat a later
+    // player-join session by the same user within the TTL window.
     purgeExpiredSpectatorIntents();
-    spectatorIntents[`${state.matchId}:${presence.userId}`] = { createdAt: Date.now() };
+    spectatorIntents[spectatorIntentKey(state.matchId, presence.userId, presence.sessionId)] = {
+      createdAt: Date.now(),
+      sessionId: presence.sessionId,
+    };
     return { state, accept: true };
   }
 
-  // Joining as player
+  // Joining as player — drop any stale spectator intents for this user/match
+  // so a prior abandoned spectator attempt cannot affect this seat join.
+  purgeExpiredSpectatorIntents();
+  clearSpectatorIntentsForUser(state.matchId, presence.userId);
+
   if (Object.keys(state.players).length >= state.maxPlayers) {
     // If table is full, suggest joining as spectator
     return { state, accept: false, rejectMessage: 'Match is full. Try joining as spectator.' };
@@ -331,11 +340,25 @@ const matchJoinAttempt: nkruntime.MatchJoinAttemptFunction<GameState> = function
 
 // Track users who want to join as spectators (used between matchJoinAttempt and matchJoin).
 // Wall-clock TTL so abandoned intents expire globally even when no later join runs for that match.
+// Keys include sessionId so intent cannot transfer across reconnect/new sessions.
 const SPECTATOR_INTENT_TTL_MS = 30_000;
-const spectatorIntents: { [key: string]: { createdAt: number } } = {};
+const spectatorIntents: { [key: string]: { createdAt: number; sessionId: string } } = {};
 
-function spectatorIntentKey(matchId: string, userId: string): string {
-  return `${matchId}:${userId}`;
+function spectatorIntentKey(matchId: string, userId: string, sessionId: string): string {
+  return `${matchId}:${userId}:${sessionId}`;
+}
+
+function spectatorIntentUserPrefix(matchId: string, userId: string): string {
+  return `${matchId}:${userId}:`;
+}
+
+function clearSpectatorIntentsForUser(matchId: string, userId: string): void {
+  const prefix = spectatorIntentUserPrefix(matchId, userId);
+  for (const key of Object.keys(spectatorIntents)) {
+    if (key.startsWith(prefix)) {
+      delete spectatorIntents[key];
+    }
+  }
 }
 
 /** Purge expired spectator intents across all matches (module-global map). */
@@ -446,11 +469,15 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
       continue;
     }
 
-    // Honor spectator intent accepted in matchJoinAttempt
-    const intentKey = spectatorIntentKey(state.matchId, presence.userId);
+    // Honor spectator intent accepted in matchJoinAttempt (session-bound)
+    const intentKey = spectatorIntentKey(state.matchId, presence.userId, presence.sessionId);
     const intent = spectatorIntents[intentKey];
     if (intent) {
       delete spectatorIntents[intentKey];
+      if (intent.sessionId !== presence.sessionId) {
+        // Defensive — key already includes sessionId
+        continue;
+      }
       if (Date.now() - intent.createdAt > SPECTATOR_INTENT_TTL_MS) {
         logger.warn('Spectator intent expired before matchJoin; rejecting stale join', {
           userId: presence.userId,
@@ -710,31 +737,48 @@ const matchLeave: nkruntime.MatchLeaveFunction<GameState> = function(
           'Deferring Waiting-phase leave cash-out until escrow checkpoint retry succeeds',
           { userId: presence.userId, matchId: state.matchId, chips: player.chips }
         );
-        broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
-          odid: presence.userId,
-          sittingOut: true,
-          reason: 'cashout_pending_checkpoint',
-        });
+        announcePlayerLeft(
+          dispatcher,
+          nk,
+          logger,
+          {
+            odid: presence.userId,
+            sittingOut: true,
+            reason: 'cashout_pending_checkpoint',
+          },
+          presence
+        );
       } else {
         const settled = cashOutAndRemovePlayer(state, nk, presence.userId, player.chips, logger);
         if (settled) {
           logger.info('Player removed (game not started)', { userId: presence.userId });
-          broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
-            odid: presence.userId,
-            sittingOut: false,
-            walletBalance: getWalletBalanceSafe(nk, presence.userId, logger),
-          });
+          announcePlayerLeft(
+            dispatcher,
+            nk,
+            logger,
+            {
+              odid: presence.userId,
+              sittingOut: false,
+            },
+            presence
+          );
         } else {
           // Retain seat/stack until persistence succeeds
           logger.warn('Cash-out failed; retaining table stack pending retry', {
             userId: presence.userId,
             chips: player.chips,
           });
-          broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
-            odid: presence.userId,
-            sittingOut: true,
-            reason: 'cashout_pending',
-          });
+          announcePlayerLeft(
+            dispatcher,
+            nk,
+            logger,
+            {
+              odid: presence.userId,
+              sittingOut: true,
+              reason: 'cashout_pending',
+            },
+            presence
+          );
         }
       }
     }
@@ -743,13 +787,8 @@ const matchLeave: nkruntime.MatchLeaveFunction<GameState> = function(
   // Update match label
   updateMatchLabel(state, dispatcher);
 
-  // End match if no players and no spectators left
-  if (Object.keys(state.players).length === 0 && Object.keys(state.spectators).length === 0) {
-    logger.info('No players or spectators left, ending match');
-    return null;
-  }
-
-  return { state };
+  // End match if no players and no spectators left (after durable hand-stat journal)
+  return endMatchIfEmpty(state, nk, logger, 'matchLeave');
 };
 
 /**
@@ -857,7 +896,7 @@ function handleDisconnectedPlayers(
           'Deferring disconnect cash-out until escrow checkpoint retry succeeds',
           { userId: odid, matchId: state.matchId }
         );
-        broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+        announcePlayerLeft(dispatcher, nk, logger, {
           odid: odid,
           sittingOut: true,
           reason: 'cashout_pending_checkpoint',
@@ -865,14 +904,13 @@ function handleDisconnectedPlayers(
       } else {
         const settled = cashOutAndRemovePlayer(state, nk, odid, stillSeated.chips, logger);
         if (settled) {
-          broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+          announcePlayerLeft(dispatcher, nk, logger, {
             odid: odid,
             sittingOut: false,
             reason: 'disconnect_timeout',
-            walletBalance: getWalletBalanceSafe(nk, odid, logger),
           });
         } else {
-          broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+          announcePlayerLeft(dispatcher, nk, logger, {
             odid: odid,
             sittingOut: true,
             reason: 'cashout_pending',
@@ -887,7 +925,7 @@ function handleDisconnectedPlayers(
       ) {
         stillSeated.status = PlayerStatus.SittingOut;
       }
-      broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+      announcePlayerLeft(dispatcher, nk, logger, {
         odid: odid,
         sittingOut: true,
         reason: 'disconnect_timeout_pending_hand',
@@ -908,6 +946,110 @@ function getWalletBalanceSafe(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Public PLAYER_LEFT never includes walletBalance (owner-only). When the owner
+ * presence is still available, send a targeted copy with their settled balance.
+ */
+function announcePlayerLeft(
+  dispatcher: nkruntime.MatchDispatcher,
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger,
+  payload: { odid: string; sittingOut: boolean; reason?: string },
+  ownerPresence?: nkruntime.Presence | null
+): void {
+  broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+    odid: payload.odid,
+    sittingOut: payload.sittingOut,
+    reason: payload.reason,
+  });
+
+  if (!ownerPresence || ownerPresence.userId !== payload.odid) {
+    return;
+  }
+
+  const walletBalance = getWalletBalanceSafe(nk, payload.odid, logger);
+  if (typeof walletBalance !== 'number') {
+    return;
+  }
+
+  sendMessage(
+    dispatcher,
+    OpCode.PLAYER_LEFT,
+    {
+      odid: payload.odid,
+      sittingOut: payload.sittingOut,
+      reason: payload.reason,
+      walletBalance,
+    },
+    ownerPresence
+  );
+}
+
+/**
+ * Persist in-memory hand-stat retries before the match may end.
+ * Returns true when durable (or none pending); false if storage still failing.
+ */
+function persistPendingHandStatRetries(
+  state: GameState,
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger
+): boolean {
+  if (!state.pendingHandStatRetries || state.pendingHandStatRetries.length === 0) {
+    return true;
+  }
+
+  const stillPending: NonNullable<GameState['pendingHandStatRetries']> = [];
+  for (const pending of state.pendingHandStatRetries) {
+    try {
+      enqueuePendingHandStatistics(
+        nk,
+        state.matchId,
+        pending.handNumber,
+        pending.userId,
+        pending.netChange,
+        pending.wonHand,
+        logger
+      );
+    } catch (e) {
+      logger.warn('Failed to persist hand-stat retry before match end', {
+        userId: pending.userId,
+        handNumber: pending.handNumber,
+        error: e,
+      });
+      stillPending.push(pending);
+    }
+  }
+
+  state.pendingHandStatRetries = stillPending.length > 0 ? stillPending : undefined;
+  return stillPending.length === 0;
+}
+
+/**
+ * End the match only when empty AND in-memory hand-stat retries are durable.
+ * Keeps the match alive when journal writes are still failing.
+ */
+function endMatchIfEmpty(
+  state: GameState,
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger,
+  reason: string
+): { state: GameState } | null {
+  if (Object.keys(state.players).length > 0 || Object.keys(state.spectators).length > 0) {
+    return { state };
+  }
+
+  if (!persistPendingHandStatRetries(state, nk, logger)) {
+    logger.warn(
+      'Match empty but hand-stat retries not yet durable; keeping match alive',
+      { matchId: state.matchId, reason }
+    );
+    return { state };
+  }
+
+  logger.info('No players or spectators left, ending match', { matchId: state.matchId, reason });
+  return null;
 }
 
 /**
@@ -1005,11 +1147,10 @@ function settlePendingLeaves(
         const chips = player.chips;
         delete state.players[userId];
         logger.info('Settled pending leave after hand', { userId, chips });
-        broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+        announcePlayerLeft(dispatcher, nk, logger, {
           odid: userId,
           sittingOut: false,
           reason: 'pending_leave_settled',
-          walletBalance: getWalletBalanceSafe(nk, userId, logger),
         });
       }
     } catch (e) {
@@ -1032,11 +1173,10 @@ function settlePendingLeaves(
     const settled = cashOutAndRemovePlayer(state, nk, userId, chips, logger);
     if (settled) {
       logger.info('Settled pending leave after hand', { userId, chips });
-      broadcastMessage(dispatcher, OpCode.PLAYER_LEFT, {
+      announcePlayerLeft(dispatcher, nk, logger, {
         odid: userId,
         sittingOut: false,
         reason: 'pending_leave_settled',
-        walletBalance: getWalletBalanceSafe(nk, userId, logger),
       });
     } else {
       logger.warn('Pending leave cash-out still failing; will retry', {
@@ -1358,8 +1498,8 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
     const hadPending = Object.values(state.players).some((p) => p.pendingLeave);
     if (hadPending && !state.escrowCheckpointFailed) {
       settlePendingLeaves(state, dispatcher, nk, logger, false);
-      if (Object.keys(state.players).length === 0 && Object.keys(state.spectators).length === 0) {
-        logger.info('No players or spectators left after pending settlement, ending match');
+      const emptied = endMatchIfEmpty(state, nk, logger, 'pending_settlement');
+      if (emptied === null) {
         return null;
       }
     }
@@ -1370,29 +1510,7 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       state.lastPendingStatsFlushTick = tick;
 
       // Persist any in-memory retries that failed both record + durable enqueue
-      if (state.pendingHandStatRetries && state.pendingHandStatRetries.length > 0) {
-        const stillPending: NonNullable<GameState['pendingHandStatRetries']> = [];
-        for (const pending of state.pendingHandStatRetries) {
-          try {
-            enqueuePendingHandStatistics(
-              nk,
-              state.matchId,
-              pending.handNumber,
-              pending.userId,
-              pending.netChange,
-              pending.wonHand,
-              logger
-            );
-          } catch (e) {
-            logger.warn('In-memory pending hand-stat enqueue still failing; will retry', {
-              userId: pending.userId,
-              error: e,
-            });
-            stillPending.push(pending);
-          }
-        }
-        state.pendingHandStatRetries = stillPending.length > 0 ? stillPending : undefined;
-      }
+      persistPendingHandStatRetries(state, nk, logger);
 
       for (const userId of Object.keys(state.players)) {
         try {
@@ -1467,6 +1585,15 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       // Fail-closed: do not start a new hand until post-hand escrow is checkpointed
       if (!retryEscrowCheckpointIfNeeded(state, dispatcher, nk, logger)) {
         break;
+      }
+
+      // After a successful checkpoint retry that settled every deferred leave,
+      // terminate rather than keep an empty authoritative match ticking.
+      {
+        const emptied = endMatchIfEmpty(state, nk, logger, 'checkpoint_recovery');
+        if (emptied === null) {
+          return null;
+        }
       }
 
       // Check if we have enough players to start
@@ -1940,6 +2067,9 @@ const matchTerminate: nkruntime.MatchTerminateFunction<GameState> = function(
       delete spectatorIntents[key];
     }
   }
+
+  // Best-effort durable journal of in-memory hand-stat retries before state is destroyed
+  persistPendingHandStatRetries(state, nk, logger);
 
   // Atomically settle all terminating stacks in one storageWrite so a failed
   // mid-loop cash-out cannot mix post-hand in-memory amounts with stale escrow.

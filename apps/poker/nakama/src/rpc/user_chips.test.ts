@@ -18,6 +18,7 @@ import {
   ensurePokerLeaderboard,
   flushPendingHandStatistics,
   flushPendingLeaderboardUpdates,
+  getActiveEscrowTotal,
   getChipsRpc,
   getWalletBalance,
   isPositiveBlind,
@@ -71,7 +72,9 @@ function createMockNk(
   const matchGetThrows = options.matchGetThrows ?? {};
   const leaderboardCreates: string[] = [];
   const leaderboardSortOrders: string[] = [];
+  const leaderboardOperators: string[] = [];
   const leaderboardWrites: { id: string; userId: string; score: number }[] = [];
+  const leaderboardScores = new Map<string, number>();
   let failLeaderboardWrites = false;
 
   for (const [userId, balance] of Object.entries(initialByUser)) {
@@ -95,6 +98,7 @@ function createMockNk(
   return {
     __leaderboardCreates: leaderboardCreates,
     __leaderboardSortOrders: leaderboardSortOrders,
+    __leaderboardOperators: leaderboardOperators,
     __leaderboardWrites: leaderboardWrites,
     get __failLeaderboardWrites() {
       return failLeaderboardWrites;
@@ -201,19 +205,44 @@ function createMockNk(
       }
       return null;
     },
-    leaderboardCreate: (id: string, _authoritative: boolean, sortOrder: string) => {
+    leaderboardCreate: (id: string, _authoritative: boolean, sortOrder: string, operator?: string) => {
       leaderboardCreates.push(id);
       leaderboardSortOrders.push(sortOrder);
+      leaderboardOperators.push(operator || 'set');
     },
     leaderboardRecordWrite: (id: string, userId: string, _username: string | undefined, score: number) => {
       if (failLeaderboardWrites) {
         throw new Error('transient leaderboard write failure');
       }
+      const prev = leaderboardScores.get(`${id}:${userId}`);
+      // Mirror monotonic guard / best operator for tests that write without going through updateLeaderboardScore
+      if (prev === undefined || score >= prev) {
+        leaderboardScores.set(`${id}:${userId}`, score);
+      }
       leaderboardWrites.push({ id, userId, score });
+    },
+    leaderboardRecordsList: (
+      id: string,
+      ownerIds: string[],
+      _limit?: number,
+      _cursor?: string,
+      _expiry?: number
+    ) => {
+      const ownerRecords = (ownerIds || [])
+        .map((userId) => {
+          const score = leaderboardScores.get(`${id}:${userId}`);
+          if (score === undefined) {
+            return null;
+          }
+          return { ownerId: userId, score };
+        })
+        .filter(Boolean);
+      return { records: ownerRecords, ownerRecords, nextCursor: undefined };
     },
   } as unknown as nkruntime.Nakama & {
     __leaderboardCreates: string[];
     __leaderboardSortOrders: string[];
+    __leaderboardOperators: string[];
     __leaderboardWrites: { id: string; userId: string; score: number }[];
     __failLeaderboardWrites?: boolean;
   };
@@ -838,5 +867,50 @@ describe('updateChipsRpc', () => {
     ).toThrow('update_chips is not available to clients');
 
     expect(getWalletBalance(nk, 'user1', logger)).toBe(1000);
+  });
+});
+
+describe('monotonic leaderboard writes', () => {
+  it('creates poker_total_won with best operator', () => {
+    const nk = createMockNk({ user1: 5000 }) as ReturnType<typeof createMockNk> & {
+      __leaderboardOperators: string[];
+    };
+    const logger = createLogger();
+    ensurePokerLeaderboard(nk, logger);
+    expect(nk.__leaderboardOperators).toContain('best');
+  });
+
+  it('skips a stale lower totalWon after a higher concurrent write', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+
+    expect(updateLeaderboardScore(nk, 'user1', 200, logger)).toBe(true);
+    expect(updateLeaderboardScore(nk, 'user1', 100, logger)).toBe(true);
+
+    expect(nk.__leaderboardWrites).toEqual([
+      { id: 'poker_total_won', userId: 'user1', score: 200 },
+    ]);
+  });
+});
+
+describe('getActiveEscrowTotal / get_chips escrow signal', () => {
+  it('reports active escrow so clients can poll deferred cash-outs', () => {
+    const nk = createMockNk(
+      { user1: 5000 },
+      { matchesAlive: { 'match-live': true } }
+    );
+    const logger = createLogger();
+
+    debitBuyInWithEscrow(nk, 'user1', 'match-live', 1000, logger);
+    expect(getActiveEscrowTotal(nk, 'user1', logger)).toBe(1000);
+
+    const payload = JSON.parse(
+      getChipsRpc({ userId: 'user1' } as nkruntime.Context, logger, nk, '')
+    );
+    expect(payload.activeEscrowTotal).toBe(1000);
+    expect(payload.balance).toBe(4000);
+
+    creditCashOutWithEscrowSettle(nk, 'match-live', 'user1', 1000, logger);
+    expect(getActiveEscrowTotal(nk, 'user1', logger)).toBe(0);
   });
 });

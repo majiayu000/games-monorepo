@@ -43,6 +43,8 @@ interface GetChipsResponse {
   totalLost: number;
   handsPlayed: number;
   handsWon: number;
+  /** Sum of still-active table escrow; lobby polls until 0 after deferred cash-out. */
+  activeEscrowTotal: number;
 }
 
 interface DailyRewardResponse {
@@ -590,6 +592,42 @@ function claimOrphanedEscrowRefund(
   }
 
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/**
+ * Sum still-active match escrow amounts for a user (buy-ins not yet cashed out).
+ */
+export function getActiveEscrowTotal(
+  nk: nkruntime.Nakama,
+  userId: string,
+  logger: nkruntime.Logger
+): number {
+  if (!userId) {
+    return 0;
+  }
+
+  let total = 0;
+  let cursor: string | undefined;
+
+  do {
+    let listed: nkruntime.StorageObjectList;
+    try {
+      listed = nk.storageList(userId, ESCROW_COLLECTION, 100, cursor);
+    } catch (e) {
+      logger.warn(`Failed to list active escrow for ${userId}: ${e}`);
+      return total;
+    }
+
+    for (const obj of listed.objects || []) {
+      const record = obj.value as MatchEscrowRecord | undefined;
+      if (record && record.status === 'active') {
+        total += Math.max(0, Math.floor(Number(record.amount) || 0));
+      }
+    }
+    cursor = listed.cursor;
+  } while (cursor);
+
+  return total;
 }
 
 /**
@@ -1317,6 +1355,7 @@ export const getChipsRpc: nkruntime.RpcFunction = (
     totalLost: chipsData.totalLost,
     handsPlayed: chipsData.handsPlayed,
     handsWon: chipsData.handsWon,
+    activeEscrowTotal: getActiveEscrowTotal(nk, userId, logger),
   };
 
   return JSON.stringify(response);
@@ -1721,7 +1760,8 @@ export function ensurePokerLeaderboard(
       true, // authoritative
       // Nakama TS runtime expects SortOrder.DESCENDING string value "desc", not "descending"
       'desc' as unknown as nkruntime.SortOrder,
-      'set' as unknown as nkruntime.Operator,
+      // Monotonic: never lower a score when concurrent hands finish out of order
+      'best' as unknown as nkruntime.Operator,
       null, // never reset
       undefined // metadata
     );
@@ -1735,6 +1775,8 @@ export function ensurePokerLeaderboard(
 /**
  * Update leaderboard score (called after winning).
  * Returns false when the write fails so callers can enqueue a retry.
+ * Skips writes that would lower an already-recorded score (set-operator boards /
+ * out-of-order concurrent table completions).
  */
 export function updateLeaderboardScore(
   nk: nkruntime.Nakama,
@@ -1745,6 +1787,26 @@ export function updateLeaderboardScore(
   ensurePokerLeaderboard(nk, logger);
 
   try {
+    // Guard existing "set"-operator boards against stale out-of-order writes.
+    try {
+      const listed = nk.leaderboardRecordsList(
+        POKER_LEADERBOARD_ID,
+        [userId],
+        1,
+        undefined,
+        undefined
+      );
+      const current = listed?.ownerRecords?.[0]?.score ?? listed?.records?.[0]?.score;
+      if (typeof current === 'number' && totalWon < current) {
+        logger.debug(
+          `Skipping non-monotonic leaderboard write for ${userId}: ${totalWon} < ${current}`
+        );
+        return true;
+      }
+    } catch (listError) {
+      logger.debug(`Leaderboard score lookup skipped for ${userId}: ${listError}`);
+    }
+
     nk.leaderboardRecordWrite(
       POKER_LEADERBOARD_ID,
       userId,
