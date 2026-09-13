@@ -904,6 +904,8 @@ export function getRoleFaction(role: Role): Faction {
 
 /** 邀请状态 */
 export enum InviteStatus {
+  /** Sender-side provisional claim before receiver row + secret are committed. */
+  SENDING = 'sending',
   PENDING = 'pending',       // 等待响应
   ACCEPTED = 'accepted',     // 已接受
   DECLINED = 'declined',     // 已拒绝
@@ -927,6 +929,8 @@ export interface GameInvite {
   expiresAt: number;          // 过期时间戳
   isPrivate?: boolean;        // 私密房间：accept 前必须能读到 server-only secret
   password?: string;          // 私密房间密码（仅 accept 时返回；勿写入 owner-readable storage）
+  /** Cleanup-only row retained for orphan secret retries; excluded from history cap. */
+  secretCleanupOnly?: boolean;
 }
 
 /** 创建邀请请求 */

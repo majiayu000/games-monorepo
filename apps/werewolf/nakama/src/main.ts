@@ -29,10 +29,12 @@ import {
 } from './werewolf/replay';
 import {
   buildGetPasswordSignal,
+  canCancelSenderInvite,
+  canExpireInviteStatus,
   inviteForOwnerStorage,
   inviteMayRetainPasswordSecret,
-  inviteSecretCleanupTombstone,
   invitesDroppedByHistoryCap,
+  invitesForOwnerHistoryStorage,
   isAtPendingInviteLimit,
   isBenignStorageDeleteError,
   isInviteVisibleInGetInvites,
@@ -43,6 +45,7 @@ import {
   legacyInlineInvitePassword,
   applyInviteSecretCleanupMarkers,
   markInviteSecretCleanupComplete,
+  mergeCleanupTombstoneIntoInviteList,
   needsTerminalSecretCleanup,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
@@ -51,6 +54,7 @@ import {
   shouldDeleteSecretAfterSendRollback,
   shouldDeleteSecretAfterTerminalCommit,
   storageWriteVersionFor,
+  withoutInviteId,
   type InviteListRecord,
 } from './werewolf/invite-password';
 
@@ -752,7 +756,8 @@ function rpcSendInvite(
       }
     }
 
-    // Create invite (password stays out of owner-readable invite storage)
+    // Create invite (password stays out of owner-readable invite storage).
+    // Sender starts as SENDING so cancel cannot race before the receiver row exists.
     const now = Date.now();
     const inviteId = generateInviteId();
     const invite: GameInvite = {
@@ -763,7 +768,7 @@ function rpcSendInvite(
       senderName: ctx.username,
       receiverId,
       receiverName: receiver.username || receiverId,
-      status: InviteStatus.PENDING,
+      status: InviteStatus.SENDING,
       currentPlayers: match.size,
       maxPlayers: matchLabel.maxPlayers || 12,
       createdAt: now,
@@ -776,24 +781,19 @@ function rpcSendInvite(
     let secretWritten = false;
     let senderInviteWritten = false;
     let receiverInviteWritten = false;
-    // Pre-write snapshots for safe rollback — never re-read during rollback
-    // because soft readInvites swallows errors into [] and would wipe history.
-    let senderInvitesSnapshot: GameInvite[] = [];
-    let receiverInvitesSnapshot: GameInvite[] | null = null;
 
     try {
       // Atomically claim a pending slot with a versioned sender write BEFORE
       // creating the secret, so concurrent send_invite calls cannot all pass a
       // stale read-time limit check and last-writer-wins drop references.
       const senderRecord = readInviteListOrThrow(nk, ctx.userId, 'sent');
-      senderInvitesSnapshot = senderRecord.invites.slice();
       if (isAtPendingInviteLimit(senderRecord.invites, now)) {
         return JSON.stringify({
           success: false,
           error: 'Too many pending invites',
         });
       }
-      const senderInvitesToWrite = [...senderInvitesSnapshot, invite];
+      const senderInvitesToWrite = [...senderRecord.invites, invite];
       try {
         writeInvites(nk, ctx.userId, 'sent', senderInvitesToWrite, {
           expectedVersion: senderRecord.version,
@@ -814,14 +814,21 @@ function rpcSendInvite(
         secretWritten = true;
       }
 
-      // Store invite for receiver (received invites)
+      // Store invite for receiver as PENDING (receiver never sees SENDING).
+      const receiverInvite: GameInvite = {
+        ...invite,
+        status: InviteStatus.PENDING,
+      };
       const receiverRecord = readInviteListOrThrow(nk, receiverId, 'received');
-      receiverInvitesSnapshot = receiverRecord.invites.slice();
-      const receiverInvitesToWrite = [...receiverInvitesSnapshot, invite];
+      const receiverInvitesToWrite = [...receiverRecord.invites, receiverInvite];
       writeInvites(nk, receiverId, 'received', receiverInvitesToWrite, {
         expectedVersion: receiverRecord.version,
       });
       receiverInviteWritten = true;
+
+      // Promote sender SENDING → PENDING only after receiver row is durable.
+      // Re-read + OCC so a concurrent list update cannot be overwritten.
+      promoteSenderInviteToPending(nk, ctx.userId, inviteId);
 
       // Send notification to receiver
       const notifications: nkruntime.NotificationRequest[] = [{
@@ -829,31 +836,33 @@ function rpcSendInvite(
         subject: 'game_invite',
         content: {
           type: 'game_invite',
-          invite,
+          invite: receiverInvite,
         },
         code: 81, // OpCode.INVITE_RECEIVED
         persistent: true,
       }];
       nk.notificationsSend(notifications);
     } catch (persistError) {
-      // Roll back committed invite rows so a failed send does not leave a
-      // pollable pending invite. Only delete the secret once no invite row
-      // remains; otherwise retain it so accept can still resolve the password.
+      // Roll back only this inviteId with versioned retries — never restore a
+      // stale full-list snapshot that could clobber concurrent updates.
       let senderInviteRolledBack = !senderInviteWritten;
       let receiverInviteRolledBack = !receiverInviteWritten;
       try {
         if (receiverInviteWritten) {
-          if (receiverInvitesSnapshot === null) {
-            throw new Error(
-              `Cannot roll back receiver invites for ${inviteId}: missing pre-write snapshot`
-            );
-          }
-          writeInvites(nk, receiverId, 'received', receiverInvitesSnapshot);
-          receiverInviteRolledBack = true;
+          receiverInviteRolledBack = rollbackInviteIdWithRetry(
+            nk,
+            receiverId,
+            'received',
+            inviteId
+          );
         }
         if (senderInviteWritten) {
-          writeInvites(nk, ctx.userId, 'sent', senderInvitesSnapshot);
-          senderInviteRolledBack = true;
+          senderInviteRolledBack = rollbackInviteIdWithRetry(
+            nk,
+            ctx.userId,
+            'sent',
+            inviteId
+          );
         }
       } catch (rollbackError) {
         logger.error(`Failed to roll back invite rows for ${inviteId}: ${rollbackError}`);
@@ -875,10 +884,7 @@ function rpcSendInvite(
             `Failed to delete orphan invite secret ${inviteId}: ${secretRollbackError}`
           );
           try {
-            writeInvites(nk, ctx.userId, 'sent', [
-              ...senderInvitesSnapshot,
-              inviteSecretCleanupTombstone(invite),
-            ]);
+            retainInviteSecretCleanupTombstone(nk, ctx.userId, 'sent', invite);
           } catch (tombstoneError) {
             logger.error(
               `Failed to retain cleanup tombstone for orphan secret ${inviteId}: ${tombstoneError}`
@@ -930,18 +936,15 @@ function rpcGetInvites(
     const now = Date.now();
     const validInvites: GameInvite[] = [];
     let needsWrite = false;
+    const expiredClaimIds: string[] = [];
 
     for (const invite of invites) {
-      if (
-        invite.expiresAt < now &&
-        (invite.status === InviteStatus.PENDING ||
-          invite.status === InviteStatus.ACCEPTED)
-      ) {
-        // Delete before marking expired so transient delete failures stay retryable
-        deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+      if (invite.expiresAt < now && canExpireInviteStatus(invite.status)) {
+        // Claim EXPIRED with OCC before deleting credentials so a concurrent
+        // accept that wins the versioned write keeps its password.
         invite.status = InviteStatus.EXPIRED;
-        markInviteSecretCleanupComplete(invite);
         needsWrite = true;
+        expiredClaimIds.push(invite.inviteId);
       } else if (needsTerminalSecretCleanup(invite, now)) {
         // Retry orphaned secret deletes for terminal private invites (including
         // expired declined/cancelled rows) without failing the whole list on a
@@ -970,6 +973,31 @@ function rpcGetInvites(
         writeInvites(nk, ctx.userId, type, invites, {
           expectedVersion: listRecord.version,
         });
+        // Only after the EXPIRED claim commits may secrets be deleted.
+        for (const inviteId of expiredClaimIds) {
+          const expiredInvite = invites.find((i) => i.inviteId === inviteId);
+          if (!expiredInvite) {
+            continue;
+          }
+          try {
+            deleteInvitePasswordSecret(nk, expiredInvite.inviteId, expiredInvite.senderId);
+            markInviteSecretCleanupComplete(expiredInvite);
+          } catch (cleanupError) {
+            logger.warn(
+              `Retryable expiry secret cleanup failed for ${inviteId}: ${cleanupError}`
+            );
+          }
+        }
+        if (expiredClaimIds.length > 0) {
+          persistInviteCleanupMarkersBestEffort(
+            nk,
+            logger,
+            ctx.userId,
+            type,
+            expiredClaimIds,
+            `get_invites-expiry:${ctx.userId}/${type}`
+          );
+        }
       } catch (writeError) {
         if (isStorageVersionConflictError(writeError)) {
           logger.warn(
@@ -1042,12 +1070,36 @@ function rpcRespondInvite(
     // expiry so join/notification failures can re-fetch the password.
     if (accept && invite.status === InviteStatus.ACCEPTED) {
       if (invite.expiresAt < now) {
-        deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
         invite.status = InviteStatus.EXPIRED;
-        markInviteSecretCleanupComplete(invite);
-        writeInvites(nk, ctx.userId, 'received', invites, {
-          expectedVersion: receivedRecord.version,
-        });
+        try {
+          writeInvites(nk, ctx.userId, 'received', invites, {
+            expectedVersion: receivedRecord.version,
+          });
+        } catch (claimError) {
+          if (isStorageVersionConflictError(claimError)) {
+            return JSON.stringify({
+              success: false,
+              error: 'Invite was modified concurrently, please retry',
+            });
+          }
+          throw claimError;
+        }
+        try {
+          deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+          markInviteSecretCleanupComplete(invite);
+          persistInviteCleanupMarkersBestEffort(
+            nk,
+            logger,
+            ctx.userId,
+            'received',
+            [invite.inviteId],
+            `accept-retry-expiry:${invite.inviteId}`
+          );
+        } catch (cleanupError) {
+          logger.warn(
+            `Retryable accept-retry expiry secret cleanup failed for ${invite.inviteId}: ${cleanupError}`
+          );
+        }
         return JSON.stringify({
           success: false,
           error: 'Invite has expired',
@@ -1081,12 +1133,36 @@ function rpcRespondInvite(
     }
 
     if (invite.expiresAt < now) {
-      deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
       invite.status = InviteStatus.EXPIRED;
-      markInviteSecretCleanupComplete(invite);
-      writeInvites(nk, ctx.userId, 'received', invites, {
-        expectedVersion: receivedRecord.version,
-      });
+      try {
+        writeInvites(nk, ctx.userId, 'received', invites, {
+          expectedVersion: receivedRecord.version,
+        });
+      } catch (claimError) {
+        if (isStorageVersionConflictError(claimError)) {
+          return JSON.stringify({
+            success: false,
+            error: 'Invite was modified concurrently, please retry',
+          });
+        }
+        throw claimError;
+      }
+      try {
+        deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+        markInviteSecretCleanupComplete(invite);
+        persistInviteCleanupMarkersBestEffort(
+          nk,
+          logger,
+          ctx.userId,
+          'received',
+          [invite.inviteId],
+          `respond-expiry:${invite.inviteId}`
+        );
+      } catch (cleanupError) {
+        logger.warn(
+          `Retryable respond expiry secret cleanup failed for ${invite.inviteId}: ${cleanupError}`
+        );
+      }
       return JSON.stringify({
         success: false,
         error: 'Invite has expired',
@@ -1097,6 +1173,7 @@ function rpcRespondInvite(
     // missing secret leaves the invite pending and retryable. Legacy pending
     // invites may still carry an inline password without isPrivate/secret.
     let password: string | undefined;
+    let migratedLegacySecret = false;
     if (accept) {
       const secretPassword = readInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
       const resolved = resolveAcceptInvitePassword(
@@ -1114,6 +1191,7 @@ function rpcRespondInvite(
       // Migrate legacy inline password into server-only storage for join retries
       if (password && !secretPassword) {
         writeInvitePasswordSecret(nk, invite.inviteId, invite.senderId, password);
+        migratedLegacySecret = true;
         invite.isPrivate = true;
       }
     }
@@ -1129,6 +1207,17 @@ function rpcRespondInvite(
       });
     } catch (claimError) {
       if (isStorageVersionConflictError(claimError)) {
+        // A concurrent decline/cancel won — remove a secret we just migrated so
+        // it cannot orphan against a terminal row with no cleanup path.
+        if (migratedLegacySecret) {
+          try {
+            deleteInvitePasswordSecret(nk, invite.inviteId, invite.senderId);
+          } catch (orphanCleanupError) {
+            logger.warn(
+              `Failed to delete orphan legacy migrate secret ${invite.inviteId}: ${orphanCleanupError}`
+            );
+          }
+        }
         return JSON.stringify({
           success: false,
           error: 'Invite was modified concurrently, please retry',
@@ -1260,8 +1349,8 @@ function rpcCancelInvite(
 
     const invite = invites[inviteIndex];
 
-    // Can only cancel pending invites on the sender copy
-    if (invite.status !== InviteStatus.PENDING) {
+    // Can only cancel fully published pending invites (not provisional SENDING).
+    if (!canCancelSenderInvite(invite.status)) {
       return JSON.stringify({
         success: false,
         error: `Cannot cancel invite with status: ${invite.status}`,
@@ -1510,8 +1599,9 @@ function writeInvites(
     }
   }
 
-  // Keep last N; strip passwords so storage API cannot leak them
-  const recentInvites = invites.slice(-INVITE_HISTORY_CAP).map(inviteForOwnerStorage);
+  // Keep last N regular rows; cleanup tombstones stay outside that budget.
+  // Strip passwords so storage API cannot leak them.
+  const recentInvites = invitesForOwnerHistoryStorage(invites, INVITE_HISTORY_CAP);
 
   const write: nkruntime.StorageWriteRequest = {
     collection: INVITE_CONFIG.STORAGE_COLLECTION,
@@ -1534,12 +1624,7 @@ function writeInvites(
       deleteInvitePasswordSecret(nk, drop.inviteId, drop.senderId);
     } catch (deleteError) {
       try {
-        const current = readInviteListOrThrow(nk, userId, type);
-        const withTombstone = [
-          ...current.invites.filter((i) => i.inviteId !== drop.inviteId),
-          inviteSecretCleanupTombstone(drop),
-        ];
-        writeInvites(nk, userId, type, withTombstone);
+        retainInviteSecretCleanupTombstone(nk, userId, type, drop);
       } catch (tombstoneError) {
         // Propagate the original delete failure; tombstone retention also failed.
         throw new Error(
@@ -1549,6 +1634,111 @@ function writeInvites(
       }
     }
   }
+}
+
+/**
+ * Versioned removal of a single inviteId. Retries on OCC conflict so send
+ * rollback cannot clobber concurrent list updates with a stale snapshot.
+ */
+function rollbackInviteIdWithRetry(
+  nk: nkruntime.Nakama,
+  userId: string,
+  type: 'sent' | 'received',
+  inviteId: string,
+  maxAttempts: number = 5
+): boolean {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const record = readInviteListOrThrow(nk, userId, type);
+    if (!record.invites.some((invite) => invite.inviteId === inviteId)) {
+      return true;
+    }
+    try {
+      writeInvites(nk, userId, type, withoutInviteId(record.invites, inviteId), {
+        expectedVersion: record.version,
+      });
+      return true;
+    } catch (error) {
+      if (!isStorageVersionConflictError(error)) {
+        throw error;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Promote a provisional sender SENDING row to PENDING after the receiver
+ * commit. Retries on OCC; throws if the provisional row disappeared.
+ */
+function promoteSenderInviteToPending(
+  nk: nkruntime.Nakama,
+  senderId: string,
+  inviteId: string,
+  maxAttempts: number = 5
+): void {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const record = readInviteListOrThrow(nk, senderId, 'sent');
+    const index = record.invites.findIndex((invite) => invite.inviteId === inviteId);
+    if (index === -1) {
+      throw new Error(`Sender invite ${inviteId} missing during PENDING promote`);
+    }
+    const current = record.invites[index];
+    if (current.status === InviteStatus.PENDING) {
+      return;
+    }
+    if (current.status !== InviteStatus.SENDING) {
+      throw new Error(
+        `Sender invite ${inviteId} has unexpected status ${current.status} during PENDING promote`
+      );
+    }
+    record.invites[index] = {
+      ...current,
+      status: InviteStatus.PENDING,
+    };
+    try {
+      writeInvites(nk, senderId, 'sent', record.invites, {
+        expectedVersion: record.version,
+      });
+      return;
+    } catch (error) {
+      if (!isStorageVersionConflictError(error)) {
+        throw error;
+      }
+    }
+  }
+  throw new Error(`Sender invite ${inviteId} PENDING promote exhausted OCC retries`);
+}
+
+/**
+ * OCC-guarded cleanup tombstone retain. Cleanup-only rows sit outside the
+ * user-visible history cap so this cannot evict actionable invites.
+ */
+function retainInviteSecretCleanupTombstone(
+  nk: nkruntime.Nakama,
+  userId: string,
+  type: 'sent' | 'received',
+  drop: GameInvite,
+  maxAttempts: number = 5
+): void {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const current = readInviteListOrThrow(nk, userId, type);
+    const withTombstone = mergeCleanupTombstoneIntoInviteList(current.invites, drop);
+    try {
+      writeInvites(nk, userId, type, withTombstone, {
+        expectedVersion: current.version,
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isStorageVersionConflictError(error)) {
+        throw error;
+      }
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`Failed to retain cleanup tombstone for ${drop.inviteId}: ${lastError}`);
 }
 
 /**

@@ -6,13 +6,18 @@ import { describe, it, expect, beforeEach } from 'bun:test';
 import {
   authorizeAndGetMatchPassword,
   buildGetPasswordSignal,
+  canCancelSenderInvite,
+  canExpireInviteStatus,
+  countsTowardPendingInviteLimit,
   handleMatchSignalPayload,
   inviteForOwnerStorage,
   inviteMayRetainPasswordSecret,
   inviteSecretCleanupTombstone,
   invitesDroppedByHistoryCap,
+  invitesForOwnerHistoryStorage,
   isAtPendingInviteLimit,
   isBenignStorageDeleteError,
+  isInviteSecretCleanupOnly,
   isInviteVisibleInGetInvites,
   isStorageVersionConflictError,
   INVITE_HISTORY_CAP,
@@ -21,6 +26,7 @@ import {
   legacyInlineInvitePassword,
   markInviteSecretCleanupComplete,
   applyInviteSecretCleanupMarkers,
+  mergeCleanupTombstoneIntoInviteList,
   needsTerminalSecretCleanup,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
@@ -518,7 +524,7 @@ describe('invite password attachment from matchSignal', () => {
     expect(isAtPendingInviteLimit(invites.slice(0, -1), now)).toBe(false);
   });
 
-  it('expiry cleanup only targets statuses that may retain secrets', () => {
+  it('expiry cleanup claims EXPIRED before deleting secrets', () => {
     const secretStore: Record<string, { password: string }> = {
       'inv-expired': { password: 'stale-secret' },
       'inv-declined': { password: 'should-not-touch' },
@@ -557,19 +563,23 @@ describe('invite password attachment from matchSignal', () => {
     ];
 
     const now = Date.now();
+    const expiredClaimIds: string[] = [];
     for (const invite of invites) {
-      if (invite.expiresAt < now) {
-        if (
-          invite.status === InviteStatus.PENDING ||
-          invite.status === InviteStatus.ACCEPTED
-        ) {
-          delete secretStore[invite.inviteId];
-          invite.status = InviteStatus.EXPIRED;
-        }
+      if (invite.expiresAt < now && canExpireInviteStatus(invite.status)) {
+        invite.status = InviteStatus.EXPIRED;
+        expiredClaimIds.push(invite.inviteId);
       }
     }
 
     expect(invites[0].status).toBe(InviteStatus.EXPIRED);
+    expect(secretStore['inv-expired']).toEqual({ password: 'stale-secret' });
+    expect(expiredClaimIds).toEqual(['inv-expired']);
+
+    for (const inviteId of expiredClaimIds) {
+      delete secretStore[inviteId];
+      markInviteSecretCleanupComplete(invites.find((i) => i.inviteId === inviteId)!);
+    }
+
     expect(secretStore['inv-expired']).toBeUndefined();
     expect(invites[1].status).toBe(InviteStatus.DECLINED);
     expect(secretStore['inv-declined']).toEqual({ password: 'should-not-touch' });
@@ -734,6 +744,7 @@ describe('invite password attachment from matchSignal', () => {
     expect(tombstone.status).toBe(InviteStatus.CANCELLED);
     expect(tombstone.isPrivate).toBe(true);
     expect(tombstone.password).toBeUndefined();
+    expect(isInviteSecretCleanupOnly(tombstone)).toBe(true);
     expect(isInviteVisibleInGetInvites(tombstone, Date.now(), 'sent')).toBe(false);
     expect(inviteMayRetainPasswordSecret(tombstone, Date.now())).toBe(false);
 
@@ -972,5 +983,82 @@ describe('invite password attachment from matchSignal', () => {
     expect(isAtPendingInviteLimit(claimB, now)).toBe(true);
     // Loser must treat version conflict as limit exceeded (no secret created yet)
     expect(isStorageVersionConflictError(new Error('version conflict'))).toBe(true);
+  });
+
+  it('provisional SENDING blocks cancel and stays hidden until promoted', () => {
+    const now = Date.now();
+    const sending: GameInvite = {
+      inviteId: 'inv-sending',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.SENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+      isPrivate: true,
+    };
+    expect(canCancelSenderInvite(InviteStatus.SENDING)).toBe(false);
+    expect(canCancelSenderInvite(InviteStatus.PENDING)).toBe(true);
+    expect(isInviteVisibleInGetInvites(sending, now, 'sent')).toBe(false);
+    expect(countsTowardPendingInviteLimit(sending, now)).toBe(true);
+    expect(inviteMayRetainPasswordSecret(sending, now)).toBe(true);
+    expect(canExpireInviteStatus(InviteStatus.SENDING)).toBe(true);
+  });
+
+  it('legacy accept migrate secret is deleted when OCC claim loses', () => {
+    const secretStore: Record<string, { password: string }> = {};
+    const legacyPassword = 'legacy-pass';
+    let migratedLegacySecret = false;
+
+    // Migrate before claim
+    secretStore['inv-legacy'] = { password: legacyPassword };
+    migratedLegacySecret = true;
+
+    const claimConflict = new Error('storage version does not match');
+    expect(isStorageVersionConflictError(claimConflict)).toBe(true);
+    if (migratedLegacySecret) {
+      delete secretStore['inv-legacy'];
+    }
+    expect(secretStore['inv-legacy']).toBeUndefined();
+  });
+
+  it('cleanup tombstones sit outside the user-visible history cap', () => {
+    const now = Date.now();
+    const regular: GameInvite[] = [];
+    for (let i = 0; i < INVITE_HISTORY_CAP; i++) {
+      regular.push({
+        inviteId: `inv-keep-${i}`,
+        matchId: 'm1',
+        roomName: 'Room',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: `guest-${i}`,
+        receiverName: 'Guest',
+        status: InviteStatus.PENDING,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: i,
+        expiresAt: now + 60_000,
+      });
+    }
+    const orphan = {
+      ...regular[0],
+      inviteId: 'inv-orphan-secret',
+      status: InviteStatus.CANCELLED,
+      isPrivate: true,
+    };
+    const withTombstone = mergeCleanupTombstoneIntoInviteList(regular, orphan);
+    expect(withTombstone).toHaveLength(INVITE_HISTORY_CAP + 1);
+    expect(invitesDroppedByHistoryCap(withTombstone)).toEqual([]);
+    const stored = invitesForOwnerHistoryStorage(withTombstone);
+    expect(stored.some((i) => i.inviteId === 'inv-keep-0')).toBe(true);
+    expect(stored.some((i) => i.inviteId === 'inv-orphan-secret' && isInviteSecretCleanupOnly(i))).toBe(
+      true
+    );
   });
 });

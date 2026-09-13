@@ -25,15 +25,21 @@ export function inviteForOwnerStorage(invite: GameInvite): GameInvite {
   return rest;
 }
 
+/** Rows kept only so get_invites can retry orphan secret deletes. */
+export function isInviteSecretCleanupOnly(invite: GameInvite): boolean {
+  return invite.secretCleanupOnly === true;
+}
+
 /**
  * Invites that may still need their server-only password secret
- * (pending accept, or accepted join retry before expiry).
+ * (provisional send, pending accept, or accepted join retry before expiry).
  */
 export function inviteMayRetainPasswordSecret(invite: GameInvite, now: number): boolean {
   if (invite.expiresAt < now) {
     return false;
   }
   return (
+    invite.status === InviteStatus.SENDING ||
     invite.status === InviteStatus.PENDING ||
     invite.status === InviteStatus.ACCEPTED
   );
@@ -43,12 +49,16 @@ export function inviteMayRetainPasswordSecret(invite: GameInvite, now: number): 
  * Invites the client may list via get_invites.
  * Pending shows in both lists. Unexpired accepted is receiver-only so join
  * retries keep an inviteId without giving senders a broken Cancel UX.
+ * Provisional SENDING rows stay hidden until the receiver commit promotes them.
  */
 export function isInviteVisibleInGetInvites(
   invite: GameInvite,
   now: number,
   listType: 'sent' | 'received' = 'received'
 ): boolean {
+  if (isInviteSecretCleanupOnly(invite)) {
+    return false;
+  }
   if (invite.expiresAt < now) {
     return false;
   }
@@ -59,6 +69,32 @@ export function isInviteVisibleInGetInvites(
     return listType === 'received';
   }
   return false;
+}
+
+/** Statuses that still count against MAX_PENDING while unexpired. */
+export function countsTowardPendingInviteLimit(
+  invite: GameInvite,
+  now: number
+): boolean {
+  return (
+    invite.expiresAt >= now &&
+    (invite.status === InviteStatus.SENDING ||
+      invite.status === InviteStatus.PENDING)
+  );
+}
+
+/** Sender cancel is only valid after the invite is fully published as PENDING. */
+export function canCancelSenderInvite(status: InviteStatus): boolean {
+  return status === InviteStatus.PENDING;
+}
+
+/** Expiry may claim these live statuses before deleting credentials. */
+export function canExpireInviteStatus(status: InviteStatus): boolean {
+  return (
+    status === InviteStatus.SENDING ||
+    status === InviteStatus.PENDING ||
+    status === InviteStatus.ACCEPTED
+  );
 }
 
 /**
@@ -82,16 +118,46 @@ export function legacyInlineInvitePassword(
 
 /**
  * Invites dropped when a list is capped to the last `limit` entries.
+ * Cleanup-only tombstones are excluded from the user-visible history budget.
  * Callers should delete secrets only when no retryable counterpart remains.
  */
 export function invitesDroppedByHistoryCap(
   invites: GameInvite[],
   limit: number = INVITE_HISTORY_CAP
 ): GameInvite[] {
-  if (invites.length <= limit) {
+  const regular = invites.filter((invite) => !isInviteSecretCleanupOnly(invite));
+  if (regular.length <= limit) {
     return [];
   }
-  return invites.slice(0, invites.length - limit);
+  return regular.slice(0, regular.length - limit);
+}
+
+/**
+ * Persist owner-readable history: cap regular rows, keep cleanup tombstones
+ * outside that budget (themselves bounded) so orphan retries cannot evict
+ * actionable invites.
+ */
+export function invitesForOwnerHistoryStorage(
+  invites: GameInvite[],
+  limit: number = INVITE_HISTORY_CAP
+): GameInvite[] {
+  const regular = invites.filter((invite) => !isInviteSecretCleanupOnly(invite));
+  const cleanup = invites.filter((invite) => isInviteSecretCleanupOnly(invite));
+  return [...regular.slice(-limit), ...cleanup.slice(-limit)].map(inviteForOwnerStorage);
+}
+
+/**
+ * Upsert a cleanup tombstone without relying on an unversioned full-list restore.
+ */
+export function mergeCleanupTombstoneIntoInviteList(
+  invites: GameInvite[],
+  tombstoneSource: GameInvite
+): GameInvite[] {
+  const tombstone = inviteSecretCleanupTombstone(tombstoneSource);
+  return [
+    ...invites.filter((invite) => invite.inviteId !== tombstone.inviteId),
+    tombstone,
+  ];
 }
 
 /**
@@ -115,9 +181,7 @@ export function shouldDeleteSecretAfterHistoryCap(
 }
 
 export function countPendingInvites(invites: GameInvite[], now: number): number {
-  return invites.filter(
-    (invite) => invite.status === InviteStatus.PENDING && invite.expiresAt >= now
-  ).length;
+  return invites.filter((invite) => countsTowardPendingInviteLimit(invite, now)).length;
 }
 
 export function isAtPendingInviteLimit(
@@ -238,8 +302,9 @@ export function shouldDeleteSecretAfterSendRollback(
 }
 
 /**
- * When send-rollback secret deletion fails after both invite rows are gone,
- * keep a terminal private tombstone so get_invites can retry cleanup.
+ * When send-rollback / history-cap secret deletion fails after the invite row
+ * is gone, keep a terminal private tombstone so get_invites can retry cleanup.
+ * Marked secretCleanupOnly so history capping cannot evict live invites.
  */
 export function inviteSecretCleanupTombstone(invite: GameInvite): GameInvite {
   return inviteForOwnerStorage({
@@ -247,6 +312,7 @@ export function inviteSecretCleanupTombstone(invite: GameInvite): GameInvite {
     status: InviteStatus.CANCELLED,
     isPrivate: true,
     password: undefined,
+    secretCleanupOnly: true,
   });
 }
 
