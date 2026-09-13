@@ -83,6 +83,8 @@ export interface PendingHandStatRecord {
   netChange: number;
   wonHand: boolean;
   createdAt: number;
+  /** pending = queued; applied = stats credited (safe to delete without re-applying) */
+  status?: 'pending' | 'applied';
 }
 
 export type MatchLiveness = 'alive' | 'dead' | 'unknown';
@@ -1005,6 +1007,7 @@ export function enqueuePendingHandStatistics(
     netChange,
     wonHand,
     createdAt: Date.now(),
+    status: 'pending',
   };
 
   try {
@@ -1030,7 +1033,145 @@ export function enqueuePendingHandStatistics(
 }
 
 /**
+ * Apply one pending hand-stat record with OCC claim: wallet stats + status→applied
+ * share a single storageWrite so concurrent flushers cannot double-count the hand.
+ */
+function applyPendingHandStatistic(
+  nk: nkruntime.Nakama,
+  userId: string,
+  obj: nkruntime.StorageObject,
+  logger: nkruntime.Logger
+): boolean {
+  const pending = obj.value as PendingHandStatRecord | undefined;
+  if (!pending) {
+    return false;
+  }
+
+  // Already claimed/applied — only clean up the queue marker.
+  if (pending.status === 'applied') {
+    try {
+      nk.storageDelete([
+        {
+          collection: HAND_STATS_PENDING_COLLECTION,
+          key: obj.key,
+          userId,
+        },
+      ]);
+    } catch (deleteError) {
+      logger.warn(
+        `Failed to delete applied pending hand stats for ${userId}: ${deleteError}`
+      );
+    }
+    return false;
+  }
+
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= WALLET_WRITE_MAX_ATTEMPTS; attempt++) {
+    try {
+      // Re-read queue entry for current OCC version on retries
+      const queueObjects = nk.storageRead([
+        {
+          collection: HAND_STATS_PENDING_COLLECTION,
+          key: obj.key,
+          userId,
+        },
+      ]);
+      if (queueObjects.length === 0) {
+        return false; // another flusher deleted it
+      }
+      const queueObj = queueObjects[0];
+      const queueValue = queueObj.value as PendingHandStatRecord;
+      if (queueValue.status === 'applied') {
+        try {
+          nk.storageDelete([
+            {
+              collection: HAND_STATS_PENDING_COLLECTION,
+              key: obj.key,
+              userId,
+            },
+          ]);
+        } catch (deleteError) {
+          logger.warn(
+            `Failed to delete applied pending hand stats for ${userId}: ${deleteError}`
+          );
+        }
+        return false;
+      }
+
+      const stored = getUserChips(nk, userId, logger);
+      const next: UserChipsData = { ...stored.data };
+      next.handsPlayed += 1;
+      if (queueValue.wonHand) {
+        next.handsWon += 1;
+      }
+      if (queueValue.netChange > 0) {
+        next.totalWon += queueValue.netChange;
+      } else if (queueValue.netChange < 0) {
+        next.totalLost += Math.abs(queueValue.netChange);
+      }
+      next.lastUpdated = Date.now();
+
+      const claimed: PendingHandStatRecord = {
+        ...queueValue,
+        status: 'applied',
+      };
+
+      // Atomic claim: statistics increment + pending→applied succeed or fail together
+      nk.storageWrite([
+        {
+          collection: CHIPS_COLLECTION,
+          key: CHIPS_KEY,
+          userId,
+          value: next,
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: stored.version,
+        },
+        {
+          collection: HAND_STATS_PENDING_COLLECTION,
+          key: obj.key,
+          userId,
+          value: claimed,
+          permissionRead: 1,
+          permissionWrite: 0,
+          version: queueObj.version || '*',
+        },
+      ]);
+
+      // Best-effort cleanup after the applied claim (safe if this fails)
+      try {
+        nk.storageDelete([
+          {
+            collection: HAND_STATS_PENDING_COLLECTION,
+            key: obj.key,
+            userId,
+          },
+        ]);
+      } catch (deleteError) {
+        logger.warn(
+          `Applied pending hand stats but failed to delete queue entry for ${userId}: ${deleteError}`
+        );
+      }
+
+      updateLeaderboardScore(nk, userId, next.totalWon, logger);
+      return true;
+    } catch (e) {
+      lastError = e;
+      if (!isVersionConflict(e) || attempt === WALLET_WRITE_MAX_ATTEMPTS) {
+        throw e;
+      }
+      logger.warn(
+        `Pending hand stats claim conflict for ${userId} key ${obj.key}, retrying (${attempt}/${WALLET_WRITE_MAX_ATTEMPTS})`
+      );
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/**
  * Retry any pending hand-stat updates for a user. Returns how many were applied.
+ * Claims each queue entry with versioned OCC in the same write as the stats update.
  */
 export function flushPendingHandStatistics(
   nk: nkruntime.Nakama,
@@ -1054,27 +1195,10 @@ export function flushPendingHandStatistics(
     }
 
     for (const obj of listed.objects || []) {
-      const pending = obj.value as PendingHandStatRecord | undefined;
-      if (!pending) {
-        continue;
-      }
-
       try {
-        recordHandStatistics(nk, userId, pending.netChange, !!pending.wonHand, logger);
-        try {
-          nk.storageDelete([
-            {
-              collection: HAND_STATS_PENDING_COLLECTION,
-              key: obj.key,
-              userId,
-            },
-          ]);
-        } catch (deleteError) {
-          logger.warn(
-            `Applied pending hand stats but failed to delete queue entry for ${userId}: ${deleteError}`
-          );
+        if (applyPendingHandStatistic(nk, userId, obj, logger)) {
+          flushed += 1;
         }
-        flushed += 1;
       } catch (e) {
         logger.warn(
           `Pending hand statistics still failing for ${userId} key ${obj.key}: ${e}`

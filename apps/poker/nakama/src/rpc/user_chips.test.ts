@@ -482,6 +482,56 @@ describe('pending hand statistics', () => {
     expect(payload.totalWon).toBe(150);
     expect(flushPendingHandStatistics(nk, 'user1', logger)).toBe(0);
   });
+
+  it('claims pending stats with OCC so concurrent flushes cannot double-count', () => {
+    const nk = createMockNk({ user1: 5000 });
+    const logger = createLogger();
+
+    enqueuePendingHandStatistics(nk, 'match-1', 7, 'user1', 100, true, logger);
+
+    // First flush claims + applies; second flush must not increment again.
+    expect(flushPendingHandStatistics(nk, 'user1', logger)).toBe(1);
+    expect(flushPendingHandStatistics(nk, 'user1', logger)).toBe(0);
+
+    const chips = (nk.storageRead as Function)([
+      { collection: 'user_data', key: 'chips', userId: 'user1' },
+    ])[0].value;
+    expect(chips.handsPlayed).toBe(1);
+    expect(chips.handsWon).toBe(1);
+    expect(chips.totalWon).toBe(100);
+  });
+});
+
+describe('terminate-style atomic cash-outs', () => {
+  it('settles all terminating stacks in one write without partial credit', () => {
+    const nk = createMockNk({ winner: 4000, loser: 4000 });
+    const logger = createLogger();
+    writeMatchEscrow(nk, 'match-term', 'winner', 1000, logger);
+    writeMatchEscrow(nk, 'match-term', 'loser', 1000, logger);
+
+    // Post-hand in-memory stacks differ from pre-hand escrow (checkpoint failed case)
+    const result = settleCashOutsAndEscrowCheckpoint(
+      nk,
+      'match-term',
+      [
+        { userId: 'winner', amount: 1100 },
+        { userId: 'loser', amount: 900 },
+      ],
+      [],
+      logger
+    );
+
+    expect(result.settledUserIds.sort()).toEqual(['loser', 'winner']);
+    expect(getWalletBalance(nk, 'winner', logger)).toBe(5100);
+    expect(getWalletBalance(nk, 'loser', logger)).toBe(4900);
+    // Total conserved: 8000 wallet start + 0 leftover escrow = 10000 chips system
+    expect(
+      getWalletBalance(nk, 'winner', logger) + getWalletBalance(nk, 'loser', logger)
+    ).toBe(10000);
+
+    expect(reconcileOrphanedEscrows(nk, 'winner', logger)).toBe(0);
+    expect(reconcileOrphanedEscrows(nk, 'loser', logger)).toBe(0);
+  });
 });
 
 describe('ensurePokerLeaderboard', () => {

@@ -36,6 +36,9 @@ import {
 
 // Match tick rate (10 ticks per second)
 const TICK_RATE = 10;
+/** Flush pending hand stats at most once every N seconds while Waiting */
+const PENDING_STATS_FLUSH_INTERVAL_SECONDS = 5;
+const PENDING_STATS_FLUSH_INTERVAL_TICKS = PENDING_STATS_FLUSH_INTERVAL_SECONDS * TICK_RATE;
 
 // Turn timeout in seconds
 const TURN_TIMEOUT_SECONDS = 30;
@@ -1138,12 +1141,16 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       }
     }
 
-    // Retry any durable pending hand-stat updates for seated users
-    for (const userId of Object.keys(state.players)) {
-      try {
-        flushPendingHandStatistics(nk, userId, logger);
-      } catch (e) {
-        logger.warn('Failed flushing pending hand statistics', { userId, error: e });
+    // Retry durable pending hand-stat updates on a bounded interval (not every 10 Hz tick)
+    const lastFlush = state.lastPendingStatsFlushTick ?? -PENDING_STATS_FLUSH_INTERVAL_TICKS;
+    if (tick - lastFlush >= PENDING_STATS_FLUSH_INTERVAL_TICKS) {
+      state.lastPendingStatsFlushTick = tick;
+      for (const userId of Object.keys(state.players)) {
+        try {
+          flushPendingHandStatistics(nk, userId, logger);
+        } catch (e) {
+          logger.warn('Failed flushing pending hand statistics', { userId, error: e });
+        }
       }
     }
   }
@@ -1649,26 +1656,53 @@ const matchTerminate: nkruntime.MatchTerminateFunction<GameState> = function(
     playerCount: Object.keys(state.players).length
   });
 
-  // Cash out all remaining table stacks, including chips committed to pots this hand
-  Object.entries(state.players).forEach(([userId, player]) => {
-    const refund = player.chips + (player.totalBetThisHand || 0);
-    const ok = cashOutPlayer(nk, state.matchId, userId, refund, logger);
-    if (ok) {
-      player.chips = 0;
-      player.totalBetThisHand = 0;
-      player.currentBet = 0;
-    } else {
-      // Keep recoverable amounts on the player record for retry / recovery
+  // Atomically settle all terminating stacks in one storageWrite so a failed
+  // mid-loop cash-out cannot mix post-hand in-memory amounts with stale escrow.
+  const cashOuts = Object.entries(state.players).map(([userId, player]) => ({
+    userId,
+    amount: player.chips + (player.totalBetThisHand || 0),
+  }));
+
+  try {
+    const { settledUserIds } = settleCashOutsAndEscrowCheckpoint(
+      nk,
+      state.matchId,
+      cashOuts,
+      [],
+      logger
+    );
+    const settled = new Set(settledUserIds);
+    for (const [userId, player] of Object.entries(state.players)) {
+      const refund = player.chips + (player.totalBetThisHand || 0);
+      if (settled.has(userId)) {
+        player.chips = 0;
+        player.totalBetThisHand = 0;
+        player.currentBet = 0;
+      } else {
+        player.chips = refund;
+        player.totalBetThisHand = 0;
+        player.currentBet = 0;
+        player.pendingLeave = true;
+        logger.error('Terminate cash-out omitted player; escrow retained for recovery', {
+          userId,
+          refund,
+        });
+      }
+    }
+  } catch (e) {
+    for (const [userId, player] of Object.entries(state.players)) {
+      const refund = player.chips + (player.totalBetThisHand || 0);
       player.chips = refund;
       player.totalBetThisHand = 0;
       player.currentBet = 0;
       player.pendingLeave = true;
-      logger.error('Terminate cash-out failed; escrow retained for recovery', {
+      logger.error('Terminate atomic cash-out failed; escrow retained for recovery', {
         userId,
         refund,
+        error: e,
       });
     }
-  });
+  }
   state.pots = [{ amount: 0, eligiblePlayers: [] }];
 
   return { state };

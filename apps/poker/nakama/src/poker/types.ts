@@ -144,6 +144,12 @@ export interface GameState {
    * until a successful retry so reconciliation cannot refund a stale distribution.
    */
   escrowCheckpointFailed?: boolean;
+
+  /**
+   * Match tick of the last pending-hand-stats flush attempt while Waiting.
+   * Used to throttle storageList scans away from every 10 Hz tick.
+   */
+  lastPendingStatsFlushTick?: number;
 }
 
 // Messages from client to server
