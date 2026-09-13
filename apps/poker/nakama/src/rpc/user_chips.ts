@@ -8,10 +8,11 @@ const CHIPS_COLLECTION = 'user_data';
 const CHIPS_KEY = 'chips';
 
 // Default starting chips for new users
-const DEFAULT_STARTING_CHIPS = 10000;
+export const DEFAULT_STARTING_CHIPS = 10000;
 
-// Minimum buy-in for tables
-const MIN_BUY_IN = 100;
+// Buy-in bounds for table seats / private matches
+export const MIN_BUY_IN = 100;
+export const MAX_STARTING_CHIPS = DEFAULT_STARTING_CHIPS;
 
 interface UserChipsData {
   balance: number;
@@ -31,23 +32,18 @@ interface GetChipsResponse {
   handsWon: number;
 }
 
-interface UpdateChipsRequest {
-  amount: number;
-  reason: 'buy_in' | 'cash_out' | 'win' | 'lose' | 'bonus' | 'daily_reward';
-}
-
-interface UpdateChipsResponse {
-  balance: number;
-  previousBalance: number;
-  change: number;
-}
-
 interface DailyRewardResponse {
   rewarded: boolean;
   amount: number;
   balance: number;
   nextRewardTime: number;
   message: string;
+}
+
+export interface WalletMutationResult {
+  balance: number;
+  previousBalance: number;
+  change: number;
 }
 
 // Helper to get or initialize user chips
@@ -116,6 +112,91 @@ function saveUserChips(
 }
 
 /**
+ * Read wallet balance (initializes storage for new users).
+ */
+export function getWalletBalance(
+  nk: nkruntime.Nakama,
+  userId: string,
+  logger: nkruntime.Logger
+): number {
+  return getUserChips(nk, userId, logger).balance;
+}
+
+/**
+ * Clamp table buy-in / private-match starting chips to server bounds.
+ */
+export function clampStartingChips(value: number): number {
+  if (!Number.isFinite(value)) {
+    return MIN_BUY_IN;
+  }
+  return Math.min(Math.max(Math.floor(value), MIN_BUY_IN), MAX_STARTING_CHIPS);
+}
+
+/**
+ * Server-internal: debit wallet for table buy-in. Does not mint chips.
+ */
+export function debitBuyIn(
+  nk: nkruntime.Nakama,
+  userId: string,
+  amount: number,
+  logger: nkruntime.Logger
+): WalletMutationResult {
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < MIN_BUY_IN) {
+    throw new Error(`Minimum buy-in is ${MIN_BUY_IN} chips`);
+  }
+
+  const buyIn = Math.floor(amount);
+  const chipsData = getUserChips(nk, userId, logger);
+  const previousBalance = chipsData.balance;
+
+  if (chipsData.balance < buyIn) {
+    throw new Error('Insufficient chips for buy-in');
+  }
+
+  chipsData.balance -= buyIn;
+  saveUserChips(nk, userId, chipsData);
+  logger.info(
+    `User ${userId} buy-in debit: ${previousBalance} -> ${chipsData.balance} (amount: ${buyIn})`
+  );
+
+  return {
+    balance: chipsData.balance,
+    previousBalance,
+    change: chipsData.balance - previousBalance,
+  };
+}
+
+/**
+ * Server-internal: credit remaining table chips back to wallet on cash-out.
+ */
+export function creditCashOut(
+  nk: nkruntime.Nakama,
+  userId: string,
+  amount: number,
+  logger: nkruntime.Logger
+): WalletMutationResult {
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0) {
+    throw new Error('Cash out amount must be non-negative');
+  }
+
+  const credit = Math.floor(amount);
+  const chipsData = getUserChips(nk, userId, logger);
+  const previousBalance = chipsData.balance;
+
+  chipsData.balance += credit;
+  saveUserChips(nk, userId, chipsData);
+  logger.info(
+    `User ${userId} cash-out credit: ${previousBalance} -> ${chipsData.balance} (amount: ${credit})`
+  );
+
+  return {
+    balance: chipsData.balance,
+    previousBalance,
+    change: chipsData.balance - previousBalance,
+  };
+}
+
+/**
  * Get user's chip balance and stats
  */
 export const getChipsRpc: nkruntime.RpcFunction = (
@@ -143,87 +224,16 @@ export const getChipsRpc: nkruntime.RpcFunction = (
 };
 
 /**
- * Update user's chip balance (server-initiated)
- * This is called internally by match handlers, not directly by clients
+ * Legacy client-callable update_chips — hard-rejected to prevent balance minting.
+ * Wallet mutations must go through debitBuyIn / creditCashOut from match handlers.
  */
 export const updateChipsRpc: nkruntime.RpcFunction = (
-  ctx: nkruntime.Context,
-  logger: nkruntime.Logger,
-  nk: nkruntime.Nakama,
-  payload: string
+  _ctx: nkruntime.Context,
+  _logger: nkruntime.Logger,
+  _nk: nkruntime.Nakama,
+  _payload: string
 ): string => {
-  const userId = ctx.userId;
-  if (!userId) {
-    throw new Error('User not authenticated');
-  }
-
-  let request: UpdateChipsRequest;
-  try {
-    request = JSON.parse(payload);
-  } catch {
-    throw new Error('Invalid request payload');
-  }
-
-  if (typeof request.amount !== 'number') {
-    throw new Error('Amount must be a number');
-  }
-
-  const chipsData = getUserChips(nk, userId, logger);
-  const previousBalance = chipsData.balance;
-
-  // Update based on reason
-  switch (request.reason) {
-    case 'buy_in':
-      if (request.amount < MIN_BUY_IN) {
-        throw new Error(`Minimum buy-in is ${MIN_BUY_IN} chips`);
-      }
-      if (chipsData.balance < request.amount) {
-        throw new Error('Insufficient chips for buy-in');
-      }
-      chipsData.balance -= request.amount;
-      break;
-
-    case 'cash_out':
-      if (request.amount < 0) {
-        throw new Error('Cash out amount must be positive');
-      }
-      chipsData.balance += request.amount;
-      break;
-
-    case 'win':
-      chipsData.balance += request.amount;
-      chipsData.totalWon += request.amount;
-      chipsData.handsWon += 1;
-      break;
-
-    case 'lose':
-      chipsData.totalLost += Math.abs(request.amount);
-      break;
-
-    case 'bonus':
-    case 'daily_reward':
-      chipsData.balance += request.amount;
-      break;
-
-    default:
-      throw new Error('Invalid reason');
-  }
-
-  // Increment hands played for game-related actions
-  if (request.reason === 'win' || request.reason === 'lose') {
-    chipsData.handsPlayed += 1;
-  }
-
-  saveUserChips(nk, userId, chipsData);
-  logger.info(`User ${userId} chips updated: ${previousBalance} -> ${chipsData.balance} (${request.reason}: ${request.amount})`);
-
-  const response: UpdateChipsResponse = {
-    balance: chipsData.balance,
-    previousBalance,
-    change: chipsData.balance - previousBalance,
-  };
-
-  return JSON.stringify(response);
+  throw new Error('update_chips is not available to clients');
 };
 
 /**
@@ -338,9 +348,9 @@ export const getLeaderboardRpc: nkruntime.RpcFunction = (
     nk.leaderboardCreate(
       LEADERBOARD_ID,
       true, // authoritative
-      'best', // sort - highest score wins
-      'set', // operator - set score directly
-      'alltime', // reset schedule - never reset
+      nkruntime.SortOrder.DESCENDING, // highest score wins
+      nkruntime.Operator.SET, // set score directly
+      null, // never reset
       undefined // metadata
     );
   } catch {

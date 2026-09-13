@@ -2,8 +2,13 @@
  * RPC functions for finding and creating poker matches
  */
 
+import { clampStartingChips } from './user_chips';
+
 // Module name must match the registered match handler
 const POKER_MATCH_MODULE = 'poker';
+
+// Server default when client omits startingChips
+const DEFAULT_PRIVATE_STARTING_CHIPS = 1000;
 
 interface FindMatchRequest {
   minPlayers?: number;
@@ -242,9 +247,13 @@ export const createPrivateMatchRpc: nkruntime.RpcFunction = function(
   if (request.bigBlind) {
     params.bigBlind = request.bigBlind.toString();
   }
-  if (request.startingChips) {
-    params.startingChips = request.startingChips.toString();
-  }
+
+  // Never trust raw client startingChips — clamp to server bounds
+  const requestedStarting =
+    typeof request.startingChips === 'number'
+      ? request.startingChips
+      : DEFAULT_PRIVATE_STARTING_CHIPS;
+  params.startingChips = clampStartingChips(requestedStarting).toString();
 
   // Create the match
   const matchId = nk.matchCreate(POKER_MATCH_MODULE, params);

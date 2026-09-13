@@ -22,6 +22,12 @@ import {
 } from './game_state';
 import { executePlayerAction, autoFold, getActionInfo } from './betting';
 import { evaluateHand, compareEvaluatedHands, EvaluatedHand, getHandRankName } from './hand_evaluator';
+import {
+  clampStartingChips,
+  creditCashOut,
+  debitBuyIn,
+  getWalletBalance,
+} from '../rpc/user_chips';
 
 // Match tick rate (10 ticks per second)
 const TICK_RATE = 10;
@@ -200,6 +206,9 @@ const matchInit: nkruntime.MatchInitFunction<GameState> = function(
   logger.info('Initializing poker match', { params });
 
   const label = params.label || 'Texas Hold\'em';
+  const rawStarting = params.startingChips
+    ? parseInt(params.startingChips, 10)
+    : DEFAULT_SETTINGS.startingChips;
 
   const state: GameState = {
     matchId: ctx.matchId || '',
@@ -209,7 +218,7 @@ const matchInit: nkruntime.MatchInitFunction<GameState> = function(
     maxPlayers: params.maxPlayers ? parseInt(params.maxPlayers) : DEFAULT_SETTINGS.maxPlayers,
     smallBlind: params.smallBlind ? parseInt(params.smallBlind) : DEFAULT_SETTINGS.smallBlind,
     bigBlind: params.bigBlind ? parseInt(params.bigBlind) : DEFAULT_SETTINGS.bigBlind,
-    startingChips: params.startingChips ? parseInt(params.startingChips) : DEFAULT_SETTINGS.startingChips,
+    startingChips: clampStartingChips(rawStarting),
     maxSpectators: params.maxSpectators ? parseInt(params.maxSpectators) : DEFAULT_SETTINGS.maxSpectators,
     phase: GamePhase.Waiting,
     players: {},
@@ -279,6 +288,21 @@ const matchJoinAttempt: nkruntime.MatchJoinAttemptFunction<GameState> = function
   if (Object.keys(state.players).length >= state.maxPlayers) {
     // If table is full, suggest joining as spectator
     return { state, accept: false, rejectMessage: 'Match is full. Try joining as spectator.' };
+  }
+
+  // Reject seat join when wallet cannot cover table buy-in
+  try {
+    const balance = getWalletBalance(nk, presence.userId, logger);
+    if (balance < state.startingChips) {
+      return {
+        state,
+        accept: false,
+        rejectMessage: `Insufficient chips for buy-in (need ${state.startingChips}, have ${balance})`,
+      };
+    }
+  } catch (e) {
+    logger.error('Failed to read wallet for join attempt', { userId: presence.userId, error: e });
+    return { state, accept: false, rejectMessage: 'Unable to verify chip balance' };
   }
 
   return { state, accept: true };
@@ -396,12 +420,37 @@ const matchJoin: nkruntime.MatchJoinFunction<GameState> = function(
       continue;
     }
 
-    // Create new player
+    // Create new player — debit wallet buy-in for table stack
+    let buyInChips = state.startingChips;
+    try {
+      debitBuyIn(nk, presence.userId, state.startingChips, logger);
+    } catch (e) {
+      logger.warn('Buy-in debit failed; seating as spectator', {
+        userId: presence.userId,
+        error: e,
+      });
+      const spectator: Spectator = {
+        odid: presence.userId,
+        displayName: presence.username || `Spectator`,
+        joinedAt: tick,
+      };
+      state.spectators[presence.userId] = spectator;
+      broadcastMessage(dispatcher, OpCode.SPECTATOR_JOINED, {
+        odid: presence.userId,
+        displayName: spectator.displayName,
+      });
+      sendMessage(dispatcher, OpCode.ERROR, {
+        message: e instanceof Error ? e.message : 'Insufficient chips for buy-in',
+      }, presence);
+      sendMessage(dispatcher, OpCode.GAME_STATE, getPublicGameState(state), presence);
+      continue;
+    }
+
     const player: Player = {
       odid: presence.userId,
       odisplayName: presence.username || `Player ${seatIndex + 1}`,
       seatIndex: seatIndex,
-      chips: state.startingChips,
+      chips: buyInChips,
       status: PlayerStatus.Waiting,
       holeCards: [],
       currentBet: 0,
@@ -523,7 +572,8 @@ const matchLeave: nkruntime.MatchLeaveFunction<GameState> = function(
         graceSeconds: DISCONNECT_GRACE_SECONDS
       });
     } else {
-      // Game hasn't started - remove player immediately
+      // Game hasn't started - cash out remaining table chips and remove player
+      cashOutPlayer(nk, presence.userId, player.chips, logger);
       delete state.players[presence.userId];
       logger.info('Player removed (game not started)', { userId: presence.userId });
 
@@ -607,12 +657,32 @@ function handleDisconnectedPlayers(
 }
 
 /**
+ * Credit remaining table chips back to the persisted wallet.
+ */
+function cashOutPlayer(
+  nk: nkruntime.Nakama,
+  userId: string,
+  chips: number,
+  logger: nkruntime.Logger
+): void {
+  if (chips <= 0) {
+    return;
+  }
+  try {
+    creditCashOut(nk, userId, chips, logger);
+  } catch (e) {
+    logger.error('Failed to credit cash-out', { userId, chips, error: e });
+  }
+}
+
+/**
  * Handle spectator requesting to become a player
  */
 function handleRequestSeat(
   state: GameState,
   dispatcher: nkruntime.MatchDispatcher,
   logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
   tick: number,
   presence: nkruntime.Presence
 ): void {
@@ -629,6 +699,16 @@ function handleRequestSeat(
   const seatIndex = findAvailableSeat(state.players, state.maxPlayers);
   if (seatIndex === -1) {
     sendMessage(dispatcher, OpCode.ERROR, { message: 'No available seats' }, presence);
+    return;
+  }
+
+  // Debit wallet buy-in before seating
+  try {
+    debitBuyIn(nk, odid, state.startingChips, logger);
+  } catch (e) {
+    sendMessage(dispatcher, OpCode.ERROR, {
+      message: e instanceof Error ? e.message : 'Insufficient chips for buy-in',
+    }, presence);
     return;
   }
 
@@ -750,7 +830,7 @@ const matchLoop: nkruntime.MatchLoopFunction<GameState> = function(
       }
     } else if (message.opCode === OpCode.REQUEST_SEAT) {
       // Spectator requesting to become a player
-      handleRequestSeat(state, dispatcher, logger, tick, message.sender);
+      handleRequestSeat(state, dispatcher, logger, nk, tick, message.sender);
     }
   }
 
@@ -1170,6 +1250,12 @@ const matchTerminate: nkruntime.MatchTerminateFunction<GameState> = function(
     matchId: state.matchId,
     graceSeconds,
     playerCount: Object.keys(state.players).length
+  });
+
+  // Cash out all remaining table stacks back to wallets
+  Object.entries(state.players).forEach(([userId, player]) => {
+    cashOutPlayer(nk, userId, player.chips, logger);
+    player.chips = 0;
   });
 
   return { state };
