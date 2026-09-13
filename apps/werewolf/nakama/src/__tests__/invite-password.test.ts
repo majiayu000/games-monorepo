@@ -1134,23 +1134,41 @@ describe('invite password attachment from matchSignal', () => {
   });
 
   it('sender expiry keeps the secret when the receiver still needs it', () => {
-    // Still actionable or accepted — do not delete until expiry is claimed.
-    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.ACCEPTED)).toBe(false);
-    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.PENDING)).toBe(false);
-    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.SENDING)).toBe(false);
+    const now = Date.now();
+    const unexpired = now + 60_000;
+    // Still actionable or accepted within deadline — do not delete.
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.ACCEPTED, now, unexpired)).toBe(
+      false
+    );
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.PENDING, now, unexpired)).toBe(
+      false
+    );
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.SENDING, now, unexpired)).toBe(
+      false
+    );
+    // Past deadline — rpcRespondInvite rejects retries; allow delete.
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.ACCEPTED, now, now - 1)).toBe(
+      true
+    );
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.PENDING, now, now - 1)).toBe(
+      true
+    );
     // Gone or already terminal — safe to delete.
-    expect(shouldDeleteSecretAfterSenderExpiry(undefined)).toBe(true);
-    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.EXPIRED)).toBe(true);
-    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.DECLINED)).toBe(true);
-    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.CANCELLED)).toBe(true);
+    expect(shouldDeleteSecretAfterSenderExpiry(undefined, now)).toBe(true);
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.EXPIRED, now)).toBe(true);
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.DECLINED, now)).toBe(true);
+    expect(shouldDeleteSecretAfterSenderExpiry(InviteStatus.CANCELLED, now)).toBe(true);
   });
 
   it('receiver expiry OCC that leaves PENDING must not authorize secret delete', () => {
     // Simulate: conditional EXPIRED write conflicted; refreshed row still PENDING.
+    const now = Date.now();
     const receiverStatusAfterOcc: InviteStatus = InviteStatus.PENDING;
     const receiverExpiryClaimed = false;
     expect(receiverExpiryClaimed).toBe(false);
-    expect(shouldDeleteSecretAfterSenderExpiry(receiverStatusAfterOcc)).toBe(false);
+    expect(
+      shouldDeleteSecretAfterSenderExpiry(receiverStatusAfterOcc, now, now + 60_000)
+    ).toBe(false);
   });
 
   it('sent-side EXPIRED history eviction consults the receiver before delete', () => {
@@ -1183,6 +1201,14 @@ describe('invite password attachment from matchSignal', () => {
     expect(
       shouldDeleteSecretAfterSentExpiredHistoryCap(expiredSent, receiverAccepted, now)
     ).toBe(false);
+    // Post-deadline ACCEPTED no longer needs join-retry credentials.
+    expect(
+      shouldDeleteSecretAfterSentExpiredHistoryCap(
+        expiredSent,
+        [{ ...receiverAccepted[0], expiresAt: now - 1 }],
+        now
+      )
+    ).toBe(true);
     expect(shouldDeleteSecretAfterSentExpiredHistoryCap(expiredSent, [], now)).toBe(true);
     expect(
       shouldDeleteSecretAfterSentExpiredHistoryCap(
@@ -1317,6 +1343,7 @@ describe('invite password attachment from matchSignal', () => {
       isPrivate: true,
     };
     const receiverAccepted: InviteStatus = InviteStatus.ACCEPTED;
+    const receiverExpiresAt = now + 60_000;
 
     expect(needsTerminalSecretCleanup(sentInvite, now)).toBe(true);
     expect(needsSenderExpiryReceiverRecheck('sent', sentInvite, now)).toBe(true);
@@ -1344,7 +1371,13 @@ describe('invite password attachment from matchSignal', () => {
     // Re-run sender-expiry receiver coordination before any delete
     for (const inviteId of expiredClaimIds) {
       if (type === 'sent') {
-        if (!shouldDeleteSecretAfterSenderExpiry(receiverAccepted)) {
+        if (
+          !shouldDeleteSecretAfterSenderExpiry(
+            receiverAccepted,
+            now,
+            receiverExpiresAt
+          )
+        ) {
           sentInvite.status = InviteStatus.ACCEPTED;
           continue;
         }
@@ -1356,6 +1389,46 @@ describe('invite password attachment from matchSignal', () => {
     expect(sentInvite.status).toBe(InviteStatus.ACCEPTED);
     expect(secretStore['inv-sent-expired']).toEqual({ password: 'join-retry-secret' });
     expect(sentInvite.isPrivate).toBe(true);
+  });
+
+  it('sender expiry deletes post-deadline ACCEPTED receiver secrets', () => {
+    const now = Date.now();
+    const secretStore: Record<string, { password: string }> = {
+      'inv-accepted-expired': { password: 'stale-secret' },
+    };
+    const sentInvite: GameInvite = {
+      inviteId: 'inv-accepted-expired',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.EXPIRED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now - 1,
+      isPrivate: true,
+    };
+    const receiverStatus = InviteStatus.ACCEPTED;
+    const receiverExpiresAt = now - 1;
+
+    expect(
+      shouldDeleteSecretAfterSenderExpiry(receiverStatus, now, receiverExpiresAt)
+    ).toBe(true);
+
+    // Transition expired ACCEPTED → EXPIRED, then delete credential.
+    let receiverRowStatus: InviteStatus = receiverStatus;
+    if (shouldDeleteSecretAfterSenderExpiry(receiverStatus, now, receiverExpiresAt)) {
+      receiverRowStatus = InviteStatus.EXPIRED;
+      delete secretStore[sentInvite.inviteId];
+      markInviteSecretCleanupComplete(sentInvite);
+    }
+
+    expect(receiverRowStatus).toBe(InviteStatus.EXPIRED);
+    expect(secretStore['inv-accepted-expired']).toBeUndefined();
+    expect(sentInvite.isPrivate).toBe(false);
   });
 
   it('cleanup tombstones sit outside the user-visible history cap', () => {

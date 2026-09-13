@@ -1026,6 +1026,7 @@ function rpcGetInvites(
           }
           if (type === 'sent') {
             let receiverStatus: InviteStatus | undefined;
+            let receiverExpiresAt: number | undefined;
             try {
               const receiverRecord = readInviteListOrThrow(
                 nk,
@@ -1038,9 +1039,18 @@ function rpcGetInvites(
               if (receiverIndex !== -1) {
                 const receiverInvite = receiverRecord.invites[receiverIndex];
                 receiverStatus = receiverInvite.status;
-                if (receiverStatus === InviteStatus.ACCEPTED) {
-                  // Receiver already accepted — keep secret for join retry and
-                  // sync the sender copy so cancel UX matches reality.
+                receiverExpiresAt = receiverInvite.expiresAt;
+                // Unexpired ACCEPTED — keep secret for join retry and sync the
+                // sender copy. Post-deadline ACCEPTED falls through so we can
+                // claim EXPIRED before deleting (rpcRespondInvite rejects retries).
+                if (
+                  receiverStatus === InviteStatus.ACCEPTED &&
+                  !shouldDeleteSecretAfterSenderExpiry(
+                    receiverStatus,
+                    now,
+                    receiverExpiresAt
+                  )
+                ) {
                   expiredInvite.status = InviteStatus.ACCEPTED;
                   if (receiverInvite.isPrivate) {
                     expiredInvite.isPrivate = true;
@@ -1067,6 +1077,7 @@ function rpcGetInvites(
                 if (canExpireInviteStatus(receiverStatus)) {
                   // Retry OCC: an unrelated receiver-list update must not let us
                   // delete the secret while the invite itself remains PENDING.
+                  // Also transitions post-deadline ACCEPTED → EXPIRED before delete.
                   let receiverExpiryClaimed = false;
                   for (let attempt = 0; attempt < 5; attempt++) {
                     const claimRecord =
@@ -1082,11 +1093,21 @@ function rpcGetInvites(
                     );
                     if (claimIndex === -1) {
                       receiverStatus = undefined;
+                      receiverExpiresAt = undefined;
                       break;
                     }
                     const claimInvite = claimRecord.invites[claimIndex];
                     receiverStatus = claimInvite.status;
-                    if (receiverStatus === InviteStatus.ACCEPTED) {
+                    receiverExpiresAt = claimInvite.expiresAt;
+                    if (
+                      receiverStatus === InviteStatus.ACCEPTED &&
+                      !shouldDeleteSecretAfterSenderExpiry(
+                        receiverStatus,
+                        now,
+                        receiverExpiresAt
+                      )
+                    ) {
+                      // Unexpired accept won during OCC — keep secret.
                       break;
                     }
                     if (!canExpireInviteStatus(receiverStatus)) {
@@ -1113,13 +1134,25 @@ function rpcGetInvites(
                   if (
                     !receiverExpiryClaimed &&
                     (receiverStatus === InviteStatus.PENDING ||
-                      receiverStatus === InviteStatus.SENDING)
+                      receiverStatus === InviteStatus.SENDING) &&
+                    !shouldDeleteSecretAfterSenderExpiry(
+                      receiverStatus,
+                      now,
+                      receiverExpiresAt
+                    )
                   ) {
-                    // Still actionable on the receiver — fail closed.
+                    // Still actionable (unexpired) on the receiver — fail closed.
                     continue;
                   }
-                  if (receiverStatus === InviteStatus.ACCEPTED) {
-                    // Accept won during OCC retries — keep secret and sync sender.
+                  if (
+                    receiverStatus === InviteStatus.ACCEPTED &&
+                    !shouldDeleteSecretAfterSenderExpiry(
+                      receiverStatus,
+                      now,
+                      receiverExpiresAt
+                    )
+                  ) {
+                    // Unexpired accept won during OCC retries — keep secret and sync.
                     expiredInvite.status = InviteStatus.ACCEPTED;
                     try {
                       const freshReceiver = readInviteListOrThrow(
@@ -1163,7 +1196,13 @@ function rpcGetInvites(
               // receiver consult / transition.
               continue;
             }
-            if (!shouldDeleteSecretAfterSenderExpiry(receiverStatus)) {
+            if (
+              !shouldDeleteSecretAfterSenderExpiry(
+                receiverStatus,
+                now,
+                receiverExpiresAt
+              )
+            ) {
               if (receiverStatus === InviteStatus.ACCEPTED) {
                 expiredInvite.status = InviteStatus.ACCEPTED;
               }

@@ -206,7 +206,11 @@ export function shouldDeleteSecretAfterSentExpiredHistoryCap(
     return shouldDeleteSecretAfterHistoryCap(dropped, receiverInvites, now);
   }
   const receiver = receiverInvites.find((other) => other.inviteId === dropped.inviteId);
-  return shouldDeleteSecretAfterSenderExpiry(receiver?.status);
+  return shouldDeleteSecretAfterSenderExpiry(
+    receiver?.status,
+    now,
+    receiver?.expiresAt
+  );
 }
 
 export function countPendingInvites(invites: GameInvite[], now: number): number {
@@ -265,13 +269,19 @@ export function shouldDeleteMigratedSecretAfterAcceptConflict(
 
 /**
  * Sender-side expiry must not wipe credentials while the receiver still needs
- * them: ACCEPTED (join retry) or still-live PENDING/SENDING rows that were not
- * successfully claimed EXPIRED (OCC left the actionable invite intact).
+ * them: unexpired ACCEPTED (join retry) or still-live PENDING/SENDING rows that
+ * were not successfully claimed EXPIRED (OCC left the actionable invite intact).
+ * Once the receiver row's `expiresAt` has passed, `rpcRespondInvite` rejects
+ * accept retries, so preserving the secret forever would orphan credentials —
+ * treat post-deadline ACCEPTED/PENDING/SENDING as deletable (callers should
+ * transition the row to EXPIRED before deleting).
  * Safe to delete when the receiver row is gone or already terminal
  * (DECLINED / CANCELLED / EXPIRED).
  */
 export function shouldDeleteSecretAfterSenderExpiry(
-  receiverStatus: InviteStatus | undefined
+  receiverStatus: InviteStatus | undefined,
+  now: number = Date.now(),
+  expiresAt?: number
 ): boolean {
   if (receiverStatus === undefined) {
     return true;
@@ -281,6 +291,9 @@ export function shouldDeleteSecretAfterSenderExpiry(
     receiverStatus === InviteStatus.PENDING ||
     receiverStatus === InviteStatus.SENDING
   ) {
+    if (typeof expiresAt === 'number' && expiresAt < now) {
+      return true;
+    }
     return false;
   }
   return true;
