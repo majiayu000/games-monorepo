@@ -487,16 +487,51 @@ export function debitBuyInWithEscrow(
 }
 
 /**
- * Distinguish a successful null matchGet (dead) from a transient lookup error.
- * Unknown liveness must not trigger escrow refunds.
+ * Extract the node suffix from a Nakama match id (`uuid.node`).
+ * Returns null when the id is not in authoritative `uuid.<node>` form
+ * (including relayed ids with an empty node suffix).
+ */
+export function parseMatchIdNode(matchId: string): string | null {
+  if (!matchId) {
+    return null;
+  }
+  // Nakama uses SplitN(id, ".", 2) — everything after the first dot is the node.
+  const dot = matchId.indexOf('.');
+  if (dot < 0 || dot === matchId.length - 1) {
+    return null;
+  }
+  return matchId.slice(dot + 1);
+}
+
+/**
+ * Distinguish live matches, proven-dead local matches, and unknown liveness.
+ *
+ * Nakama `matchGet` returns null both when a match is gone on this node and when
+ * the match runs on another node. Treating bare null as dead lets orphan
+ * reconcile credit live escrow on multi-node clusters (mint on later cash-out).
+ * Only refund when `localNode` proves the match id belongs to this node.
  */
 export function getMatchLiveness(
   nk: nkruntime.Nakama,
-  matchId: string
+  matchId: string,
+  localNode?: string
 ): MatchLiveness {
   try {
     const match = nk.matchGet(matchId);
-    return match ? 'alive' : 'dead';
+    if (match) {
+      return 'alive';
+    }
+
+    // null: require local-node ownership proof before treating as dead.
+    if (!localNode) {
+      return 'unknown';
+    }
+    const matchNode = parseMatchIdNode(matchId);
+    if (matchNode !== null && matchNode !== localNode) {
+      return 'unknown';
+    }
+    // Same-node authoritative id (or test ids without a node suffix) and null → dead.
+    return 'dead';
   } catch {
     return 'unknown';
   }
@@ -633,11 +668,13 @@ export function getActiveEscrowTotal(
 /**
  * Credit back active escrow records whose matches are no longer running.
  * Called from get_chips so crash-orphaned buy-ins are recovered on next wallet read.
+ * Pass `localNode` (ctx.node) so multi-node matchGet-null is not treated as dead.
  */
 export function reconcileOrphanedEscrows(
   nk: nkruntime.Nakama,
   userId: string,
-  logger: nkruntime.Logger
+  logger: nkruntime.Logger,
+  localNode?: string
 ): number {
   if (!userId) {
     return 0;
@@ -662,7 +699,7 @@ export function reconcileOrphanedEscrows(
         continue;
       }
 
-      const liveness = getMatchLiveness(nk, record.matchId);
+      const liveness = getMatchLiveness(nk, record.matchId, localNode);
       if (liveness === 'alive') {
         continue;
       }
@@ -1344,7 +1381,7 @@ export const getChipsRpc: nkruntime.RpcFunction = (
     throw new Error('User not authenticated');
   }
 
-  reconcileOrphanedEscrows(nk, userId, logger);
+  reconcileOrphanedEscrows(nk, userId, logger, ctx.node);
   flushPendingHandStatistics(nk, userId, logger);
   flushPendingLeaderboardUpdates(nk, userId, logger);
   const chipsData = getUserChips(nk, userId, logger).data;

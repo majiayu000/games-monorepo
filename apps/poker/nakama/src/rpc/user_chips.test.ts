@@ -20,9 +20,11 @@ import {
   flushPendingLeaderboardUpdates,
   getActiveEscrowTotal,
   getChipsRpc,
+  getMatchLiveness,
   getWalletBalance,
   isPositiveBlind,
   normalizeBlind,
+  parseMatchIdNode,
   reconcileOrphanedEscrows,
   recordHandStatistics,
   settleCashOutsAndEscrowCheckpoint,
@@ -34,6 +36,9 @@ import {
   MAX_STARTING_CHIPS,
   DEFAULT_STARTING_CHIPS,
 } from './user_chips';
+
+/** Simulated local Nakama node for multi-node liveness tests. */
+const LOCAL_NODE = 'nakama1';
 
 type StoredObject = {
   collection: string;
@@ -388,7 +393,7 @@ describe('match escrow', () => {
     const nk = createMockNk({ user1: 4000 }, { matchesAlive: {} });
     writeMatchEscrow(nk, 'dead-match', 'user1', 1000, logger);
 
-    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger);
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger, LOCAL_NODE);
     expect(refunded).toBe(1000);
     expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
 
@@ -402,7 +407,7 @@ describe('match escrow', () => {
     const nk = createMockNk({ user1: 4000 }, { matchesAlive: { 'live-match': true } });
     writeMatchEscrow(nk, 'live-match', 'user1', 1000, logger);
 
-    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger);
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger, LOCAL_NODE);
     expect(refunded).toBe(0);
     expect(getWalletBalance(nk, 'user1', logger)).toBe(4000);
   });
@@ -414,7 +419,7 @@ describe('match escrow', () => {
     );
     writeMatchEscrow(nk, 'maybe-live', 'user1', 1000, logger);
 
-    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger);
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger, LOCAL_NODE);
     expect(refunded).toBe(0);
     expect(getWalletBalance(nk, 'user1', logger)).toBe(4000);
 
@@ -425,12 +430,41 @@ describe('match escrow', () => {
     expect(stillThere[0].value.status).toBe('active');
   });
 
+  it('does not treat other-node matchGet null as dead (no cross-node mint)', () => {
+    const otherNodeMatch = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.nakama2';
+    const nk = createMockNk({ user1: 4000 }, { matchesAlive: {} });
+    writeMatchEscrow(nk, otherNodeMatch, 'user1', 1000, logger);
+
+    expect(getMatchLiveness(nk, otherNodeMatch, LOCAL_NODE)).toBe('unknown');
+    expect(parseMatchIdNode(otherNodeMatch)).toBe('nakama2');
+
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger, LOCAL_NODE);
+    expect(refunded).toBe(0);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(4000);
+
+    const stillThere = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: `escrow:${otherNodeMatch}`, userId: 'user1' },
+    ]);
+    expect(stillThere).toHaveLength(1);
+    expect(stillThere[0].value.status).toBe('active');
+  });
+
+  it('skips reconcile when localNode is missing even if matchGet returns null', () => {
+    const nk = createMockNk({ user1: 4000 }, { matchesAlive: {} });
+    writeMatchEscrow(nk, 'dead-match', 'user1', 1000, logger);
+
+    expect(getMatchLiveness(nk, 'dead-match')).toBe('unknown');
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger);
+    expect(refunded).toBe(0);
+    expect(getWalletBalance(nk, 'user1', logger)).toBe(4000);
+  });
+
   it('refunds orphaned escrow only once across concurrent reconciles', () => {
     const nk = createMockNk({ user1: 4000 }, { matchesAlive: {} });
     writeMatchEscrow(nk, 'dead-match', 'user1', 1000, logger);
 
-    const first = reconcileOrphanedEscrows(nk, 'user1', logger);
-    const second = reconcileOrphanedEscrows(nk, 'user1', logger);
+    const first = reconcileOrphanedEscrows(nk, 'user1', logger, LOCAL_NODE);
+    const second = reconcileOrphanedEscrows(nk, 'user1', logger, LOCAL_NODE);
     expect(first).toBe(1000);
     expect(second).toBe(0);
     expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
@@ -481,7 +515,7 @@ describe('match escrow', () => {
       },
     ]);
 
-    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger);
+    const refunded = reconcileOrphanedEscrows(nk, 'user1', logger, LOCAL_NODE);
     expect(refunded).toBe(0);
     expect(getWalletBalance(nk, 'user1', logger)).toBe(5000);
   });
@@ -558,7 +592,7 @@ describe('match escrow', () => {
     // Orphan reconcile then settle: chips already refunded; settle must not credit again.
     const nk2 = createMockNk({ user2: 4000 }, { matchesAlive: {} });
     writeMatchEscrow(nk2, 'dead-match', 'user2', 1000, logger);
-    expect(reconcileOrphanedEscrows(nk2, 'user2', logger)).toBe(1000);
+    expect(reconcileOrphanedEscrows(nk2, 'user2', logger, LOCAL_NODE)).toBe(1000);
     expect(getWalletBalance(nk2, 'user2', logger)).toBe(5000);
 
     const afterReconcile = settleCashOutsAndEscrowCheckpoint(
@@ -598,7 +632,7 @@ describe('match escrow', () => {
     expect(loserEscrow.value.status).toBe('active');
 
     // Winner escrow cleared (or settled-only); reconcile must not inflate totals.
-    const refunded = reconcileOrphanedEscrows(nk, 'winner', logger);
+    const refunded = reconcileOrphanedEscrows(nk, 'winner', logger, LOCAL_NODE);
     expect(refunded).toBe(0);
     expect(getWalletBalance(nk, 'winner', logger)).toBe(5100);
     expect(getWalletBalance(nk, 'loser', logger) + 900).toBe(4900);
@@ -614,7 +648,7 @@ describe('pending hand statistics', () => {
     expect(flushPendingHandStatistics(nk, 'user1', logger)).toBe(1);
 
     const payload = JSON.parse(
-      getChipsRpc({ userId: 'user1' } as nkruntime.Context, logger, nk, '')
+      getChipsRpc({ userId: 'user1', node: LOCAL_NODE } as nkruntime.Context, logger, nk, '')
     );
     expect(payload.handsPlayed).toBe(1);
     expect(payload.handsWon).toBe(1);
@@ -668,8 +702,41 @@ describe('terminate-style atomic cash-outs', () => {
       getWalletBalance(nk, 'winner', logger) + getWalletBalance(nk, 'loser', logger)
     ).toBe(10000);
 
-    expect(reconcileOrphanedEscrows(nk, 'winner', logger)).toBe(0);
-    expect(reconcileOrphanedEscrows(nk, 'loser', logger)).toBe(0);
+    expect(reconcileOrphanedEscrows(nk, 'winner', logger, LOCAL_NODE)).toBe(0);
+    expect(reconcileOrphanedEscrows(nk, 'loser', logger, LOCAL_NODE)).toBe(0);
+  });
+
+  it('checkpoints post-hand refund amounts when terminate settle fails', () => {
+    const nk = createMockNk({ winner: 4000, loser: 4000 }, { matchesAlive: {} });
+    const logger = createLogger();
+    // Pre-hand escrow still on disk (post-hand checkpoint had failed earlier)
+    writeMatchEscrow(nk, 'match-term-fail', 'winner', 1000, logger);
+    writeMatchEscrow(nk, 'match-term-fail', 'loser', 1000, logger);
+
+    // matchTerminate catch path: settle failed, so persist in-memory refund amounts
+    // before state is destroyed so orphan reconcile cannot credit stale pre-hand escrow.
+    writeMatchEscrowBatch(
+      nk,
+      'match-term-fail',
+      [
+        { userId: 'winner', amount: 1100 },
+        { userId: 'loser', amount: 900 },
+      ],
+      logger
+    );
+
+    const escrow = (nk.storageRead as Function)([
+      { collection: 'match_escrow', key: 'escrow:match-term-fail', userId: 'winner' },
+      { collection: 'match_escrow', key: 'escrow:match-term-fail', userId: 'loser' },
+    ]);
+    expect(escrow.find((o: StoredObject) => o.userId === 'winner').value.amount).toBe(1100);
+    expect(escrow.find((o: StoredObject) => o.userId === 'loser').value.amount).toBe(900);
+
+    // Orphan reconcile after terminate must credit post-hand amounts, not pre-hand.
+    expect(reconcileOrphanedEscrows(nk, 'winner', logger, LOCAL_NODE)).toBe(1100);
+    expect(reconcileOrphanedEscrows(nk, 'loser', logger, LOCAL_NODE)).toBe(900);
+    expect(getWalletBalance(nk, 'winner', logger)).toBe(5100);
+    expect(getWalletBalance(nk, 'loser', logger)).toBe(4900);
   });
 });
 
@@ -706,7 +773,7 @@ describe('recordHandStatistics', () => {
 
     recordHandStatistics(nk, 'user1', 200, true, logger);
     const payload = JSON.parse(
-      getChipsRpc({ userId: 'user1' } as nkruntime.Context, logger, nk, '')
+      getChipsRpc({ userId: 'user1', node: LOCAL_NODE } as nkruntime.Context, logger, nk, '')
     );
     expect(payload.balance).toBe(5000);
     expect(payload.handsPlayed).toBe(1);
@@ -733,7 +800,7 @@ describe('recordHandStatistics', () => {
     // mutateWallet performs the only chips read; leaderboard must not re-read wallet storage
     expect(chipReads).toBe(1);
     const payload = JSON.parse(
-      getChipsRpc({ userId: 'user1' } as nkruntime.Context, logger, nk, '')
+      getChipsRpc({ userId: 'user1', node: LOCAL_NODE } as nkruntime.Context, logger, nk, '')
     );
     expect(payload.handsPlayed).toBe(1);
     expect(payload.totalWon).toBe(150);
@@ -747,7 +814,7 @@ describe('recordHandStatistics', () => {
     recordHandStatistics(nk, 'user1', 200, true, logger);
 
     const payload = JSON.parse(
-      getChipsRpc({ userId: 'user1' } as nkruntime.Context, logger, nk, '')
+      getChipsRpc({ userId: 'user1', node: LOCAL_NODE } as nkruntime.Context, logger, nk, '')
     );
     expect(payload.totalWon).toBe(200);
     expect(nk.__leaderboardWrites).toHaveLength(0);
@@ -905,7 +972,7 @@ describe('getActiveEscrowTotal / get_chips escrow signal', () => {
     expect(getActiveEscrowTotal(nk, 'user1', logger)).toBe(1000);
 
     const payload = JSON.parse(
-      getChipsRpc({ userId: 'user1' } as nkruntime.Context, logger, nk, '')
+      getChipsRpc({ userId: 'user1', node: LOCAL_NODE } as nkruntime.Context, logger, nk, '')
     );
     expect(payload.activeEscrowTotal).toBe(1000);
     expect(payload.balance).toBe(4000);

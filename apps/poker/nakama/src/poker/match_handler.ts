@@ -2078,6 +2078,26 @@ const matchTerminate: nkruntime.MatchTerminateFunction<GameState> = function(
     amount: player.chips + (player.totalBetThisHand || 0),
   }));
 
+  const checkpointTerminateRecoveryEscrow = (
+    entries: { userId: string; amount: number }[],
+    reason: string
+  ): void => {
+    if (entries.length === 0) {
+      return;
+    }
+    try {
+      // Persist post-hand / mid-hand refund amounts before in-memory state is
+      // destroyed so orphan reconcile cannot credit a stale pre-hand checkpoint.
+      writeMatchEscrowBatch(nk, state.matchId, entries, logger);
+    } catch (persistErr) {
+      logger.error('Terminate recovery escrow checkpoint failed', {
+        matchId: state.matchId,
+        reason,
+        error: persistErr,
+      });
+    }
+  };
+
   try {
     const { settledUserIds } = settleCashOutsAndEscrowCheckpoint(
       nk,
@@ -2087,6 +2107,7 @@ const matchTerminate: nkruntime.MatchTerminateFunction<GameState> = function(
       logger
     );
     const settled = new Set(settledUserIds);
+    const omitted: { userId: string; amount: number }[] = [];
     for (const [userId, player] of Object.entries(state.players)) {
       const refund = player.chips + (player.totalBetThisHand || 0);
       if (settled.has(userId)) {
@@ -2098,25 +2119,30 @@ const matchTerminate: nkruntime.MatchTerminateFunction<GameState> = function(
         player.totalBetThisHand = 0;
         player.currentBet = 0;
         player.pendingLeave = true;
+        omitted.push({ userId, amount: refund });
         logger.error('Terminate cash-out omitted player; escrow retained for recovery', {
           userId,
           refund,
         });
       }
     }
+    checkpointTerminateRecoveryEscrow(omitted, 'omitted_players');
   } catch (e) {
+    const refundEntries: { userId: string; amount: number }[] = [];
     for (const [userId, player] of Object.entries(state.players)) {
       const refund = player.chips + (player.totalBetThisHand || 0);
       player.chips = refund;
       player.totalBetThisHand = 0;
       player.currentBet = 0;
       player.pendingLeave = true;
+      refundEntries.push({ userId, amount: refund });
       logger.error('Terminate atomic cash-out failed; escrow retained for recovery', {
         userId,
         refund,
         error: e,
       });
     }
+    checkpointTerminateRecoveryEscrow(refundEntries, 'settle_failed');
   }
   state.pots = [{ amount: 0, eligiblePlayers: [] }];
 
