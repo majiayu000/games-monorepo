@@ -1,11 +1,12 @@
 /**
  * User Chips RPC Functions
- * Manages user chip balances using Nakama Storage
+ * Manages user chip balances using Nakama Storage with version-guarded writes.
  */
 
 // Storage collection and key for user chips
 const CHIPS_COLLECTION = 'user_data';
 const CHIPS_KEY = 'chips';
+const ESCROW_COLLECTION = 'match_escrow';
 
 // Default starting chips for new users
 export const DEFAULT_STARTING_CHIPS = 10000;
@@ -13,6 +14,9 @@ export const DEFAULT_STARTING_CHIPS = 10000;
 // Buy-in bounds for table seats / private matches
 export const MIN_BUY_IN = 100;
 export const MAX_STARTING_CHIPS = DEFAULT_STARTING_CHIPS;
+
+/** Max retries for optimistic-concurrency storage conflicts */
+const WALLET_WRITE_MAX_ATTEMPTS = 8;
 
 interface UserChipsData {
   balance: number;
@@ -22,6 +26,12 @@ interface UserChipsData {
   handsWon: number;
   lastUpdated: number;
   createdAt: number;
+}
+
+interface StoredChips {
+  data: UserChipsData;
+  /** Nakama OCC version; '*' means create-only / unconditional create path */
+  version: string;
 }
 
 interface GetChipsResponse {
@@ -46,12 +56,36 @@ export interface WalletMutationResult {
   change: number;
 }
 
-// Helper to get or initialize user chips
+export interface MatchEscrowRecord {
+  matchId: string;
+  userId: string;
+  amount: number;
+  status: 'active' | 'settled';
+  createdAt: number;
+  updatedAt: number;
+}
+
+function isVersionConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('version') ||
+    lower.includes('conflict') ||
+    lower.includes('concurrent') ||
+    lower.includes('cas')
+  );
+}
+
+function escrowKey(matchId: string): string {
+  return `escrow:${matchId}`;
+}
+
+// Helper to get or initialize user chips (with storage version for OCC)
 function getUserChips(
   nk: nkruntime.Nakama,
   userId: string,
   logger: nkruntime.Logger
-): UserChipsData {
+): StoredChips {
   const objects = nk.storageRead([
     {
       collection: CHIPS_COLLECTION,
@@ -61,10 +95,13 @@ function getUserChips(
   ]);
 
   if (objects.length > 0 && objects[0].value) {
-    return objects[0].value as UserChipsData;
+    return {
+      data: objects[0].value as UserChipsData,
+      version: objects[0].version || '*',
+    };
   }
 
-  // Initialize new user with starting chips
+  // Initialize new user with starting chips (create-only via version '*')
   const now = Date.now();
   const initialData: UserChipsData = {
     balance: DEFAULT_STARTING_CHIPS,
@@ -76,26 +113,51 @@ function getUserChips(
     createdAt: now,
   };
 
-  nk.storageWrite([
-    {
-      collection: CHIPS_COLLECTION,
-      key: CHIPS_KEY,
-      userId: userId,
-      value: initialData,
-      permissionRead: 1, // Owner read
-      permissionWrite: 0, // No client write
-    },
-  ]);
-
-  logger.info(`Initialized new user ${userId} with ${DEFAULT_STARTING_CHIPS} chips`);
-  return initialData;
+  try {
+    const acks = nk.storageWrite([
+      {
+        collection: CHIPS_COLLECTION,
+        key: CHIPS_KEY,
+        userId: userId,
+        value: initialData,
+        permissionRead: 1, // Owner read
+        permissionWrite: 0, // No client write
+        version: '*', // create-only — concurrent init loses and retries via caller
+      },
+    ]);
+    logger.info(`Initialized new user ${userId} with ${DEFAULT_STARTING_CHIPS} chips`);
+    return {
+      data: initialData,
+      version: (acks && acks[0] && acks[0].version) || '1',
+    };
+  } catch (e) {
+    if (!isVersionConflict(e)) {
+      throw e;
+    }
+    // Another writer created the object; re-read
+    const retry = nk.storageRead([
+      {
+        collection: CHIPS_COLLECTION,
+        key: CHIPS_KEY,
+        userId: userId,
+      },
+    ]);
+    if (retry.length > 0 && retry[0].value) {
+      return {
+        data: retry[0].value as UserChipsData,
+        version: retry[0].version || '1',
+      };
+    }
+    throw e;
+  }
 }
 
-// Helper to save user chips
+// Helper to save user chips with optimistic concurrency
 function saveUserChips(
   nk: nkruntime.Nakama,
   userId: string,
-  data: UserChipsData
+  data: UserChipsData,
+  version: string
 ): void {
   data.lastUpdated = Date.now();
 
@@ -107,8 +169,43 @@ function saveUserChips(
       value: data,
       permissionRead: 1,
       permissionWrite: 0,
+      version,
     },
   ]);
+}
+
+function mutateWallet(
+  nk: nkruntime.Nakama,
+  userId: string,
+  logger: nkruntime.Logger,
+  mutate: (data: UserChipsData) => void
+): WalletMutationResult {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= WALLET_WRITE_MAX_ATTEMPTS; attempt++) {
+    try {
+      const stored = getUserChips(nk, userId, logger);
+      const previousBalance = stored.data.balance;
+      const next: UserChipsData = { ...stored.data };
+      mutate(next);
+      saveUserChips(nk, userId, next, stored.version);
+      return {
+        balance: next.balance,
+        previousBalance,
+        change: next.balance - previousBalance,
+      };
+    } catch (e) {
+      lastError = e;
+      if (!isVersionConflict(e) || attempt === WALLET_WRITE_MAX_ATTEMPTS) {
+        throw e;
+      }
+      logger.warn(
+        `Wallet write conflict for ${userId}, retrying (${attempt}/${WALLET_WRITE_MAX_ATTEMPTS})`
+      );
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 /**
@@ -119,7 +216,7 @@ export function getWalletBalance(
   userId: string,
   logger: nkruntime.Logger
 ): number {
-  return getUserChips(nk, userId, logger).balance;
+  return getUserChips(nk, userId, logger).data.balance;
 }
 
 /**
@@ -130,6 +227,89 @@ export function clampStartingChips(value: number): number {
     return MIN_BUY_IN;
   }
   return Math.min(Math.max(Math.floor(value), MIN_BUY_IN), MAX_STARTING_CHIPS);
+}
+
+/**
+ * Persist durable match escrow so buy-ins can be reconciled after a crash.
+ * Uses unconditional writes (last-write-wins) so escrow never blocks a completed debit.
+ */
+export function writeMatchEscrow(
+  nk: nkruntime.Nakama,
+  matchId: string,
+  userId: string,
+  amount: number,
+  logger: nkruntime.Logger
+): void {
+  if (!matchId || !userId) {
+    return;
+  }
+  const credit = Math.max(0, Math.floor(amount));
+  const now = Date.now();
+  const existing = nk.storageRead([
+    {
+      collection: ESCROW_COLLECTION,
+      key: escrowKey(matchId),
+      userId,
+    },
+  ]);
+
+  const previous =
+    existing.length > 0 && existing[0].value
+      ? (existing[0].value as MatchEscrowRecord)
+      : null;
+
+  const record: MatchEscrowRecord = {
+    matchId,
+    userId,
+    amount: credit,
+    status: 'active',
+    createdAt: previous?.createdAt || now,
+    updatedAt: now,
+  };
+
+  try {
+    nk.storageWrite([
+      {
+        collection: ESCROW_COLLECTION,
+        key: escrowKey(matchId),
+        userId,
+        value: record,
+        permissionRead: 1,
+        permissionWrite: 0,
+        // Unconditional write — escrow is a recovery snapshot, not a balance source of truth
+      },
+    ]);
+    logger.info(`Wrote match escrow for ${userId} in ${matchId}: ${credit}`);
+  } catch (e) {
+    logger.error(`Failed to write match escrow for ${userId} in ${matchId}: ${e}`);
+    throw e;
+  }
+}
+
+/**
+ * Clear match escrow after a successful cash-out / settlement.
+ */
+export function clearMatchEscrow(
+  nk: nkruntime.Nakama,
+  matchId: string,
+  userId: string,
+  logger: nkruntime.Logger
+): void {
+  if (!matchId || !userId) {
+    return;
+  }
+  try {
+    nk.storageDelete([
+      {
+        collection: ESCROW_COLLECTION,
+        key: escrowKey(matchId),
+        userId,
+      },
+    ]);
+    logger.info(`Cleared match escrow for ${userId} in ${matchId}`);
+  } catch (e) {
+    logger.warn(`Failed to clear match escrow for ${userId} in ${matchId}: ${e}`);
+  }
 }
 
 /**
@@ -146,24 +326,18 @@ export function debitBuyIn(
   }
 
   const buyIn = Math.floor(amount);
-  const chipsData = getUserChips(nk, userId, logger);
-  const previousBalance = chipsData.balance;
+  const result = mutateWallet(nk, userId, logger, (chipsData) => {
+    if (chipsData.balance < buyIn) {
+      throw new Error('Insufficient chips for buy-in');
+    }
+    chipsData.balance -= buyIn;
+  });
 
-  if (chipsData.balance < buyIn) {
-    throw new Error('Insufficient chips for buy-in');
-  }
-
-  chipsData.balance -= buyIn;
-  saveUserChips(nk, userId, chipsData);
   logger.info(
-    `User ${userId} buy-in debit: ${previousBalance} -> ${chipsData.balance} (amount: ${buyIn})`
+    `User ${userId} buy-in debit: ${result.previousBalance} -> ${result.balance} (amount: ${buyIn})`
   );
 
-  return {
-    balance: chipsData.balance,
-    previousBalance,
-    change: chipsData.balance - previousBalance,
-  };
+  return result;
 }
 
 /**
@@ -180,20 +354,15 @@ export function creditCashOut(
   }
 
   const credit = Math.floor(amount);
-  const chipsData = getUserChips(nk, userId, logger);
-  const previousBalance = chipsData.balance;
+  const result = mutateWallet(nk, userId, logger, (chipsData) => {
+    chipsData.balance += credit;
+  });
 
-  chipsData.balance += credit;
-  saveUserChips(nk, userId, chipsData);
   logger.info(
-    `User ${userId} cash-out credit: ${previousBalance} -> ${chipsData.balance} (amount: ${credit})`
+    `User ${userId} cash-out credit: ${result.previousBalance} -> ${result.balance} (amount: ${credit})`
   );
 
-  return {
-    balance: chipsData.balance,
-    previousBalance,
-    change: chipsData.balance - previousBalance,
-  };
+  return result;
 }
 
 /**
@@ -210,7 +379,7 @@ export const getChipsRpc: nkruntime.RpcFunction = (
     throw new Error('User not authenticated');
   }
 
-  const chipsData = getUserChips(nk, userId, logger);
+  const chipsData = getUserChips(nk, userId, logger).data;
 
   const response: GetChipsResponse = {
     balance: chipsData.balance,
@@ -267,9 +436,11 @@ export const claimDailyRewardRpc: nkruntime.RpcFunction = (
 
   const now = Date.now();
   let lastClaimTime = 0;
+  let rewardVersion: string | undefined;
 
   if (rewardObjects.length > 0 && rewardObjects[0].value) {
     lastClaimTime = (rewardObjects[0].value as { lastClaim: number }).lastClaim || 0;
+    rewardVersion = rewardObjects[0].version;
   }
 
   const timeSinceLastClaim = now - lastClaimTime;
@@ -278,7 +449,7 @@ export const claimDailyRewardRpc: nkruntime.RpcFunction = (
   if (timeSinceLastClaim < REWARD_COOLDOWN_MS) {
     const hoursRemaining = Math.ceil((REWARD_COOLDOWN_MS - timeSinceLastClaim) / (60 * 60 * 1000));
 
-    const chipsData = getUserChips(nk, userId, logger);
+    const chipsData = getUserChips(nk, userId, logger).data;
     const response: DailyRewardResponse = {
       rewarded: false,
       amount: 0,
@@ -289,12 +460,12 @@ export const claimDailyRewardRpc: nkruntime.RpcFunction = (
     return JSON.stringify(response);
   }
 
-  // Give the reward
-  const chipsData = getUserChips(nk, userId, logger);
-  chipsData.balance += DAILY_REWARD_AMOUNT;
-  saveUserChips(nk, userId, chipsData);
+  // Give the reward with version-guarded wallet write
+  const walletResult = mutateWallet(nk, userId, logger, (chipsData) => {
+    chipsData.balance += DAILY_REWARD_AMOUNT;
+  });
 
-  // Update last claim time
+  // Update last claim time (version-guarded when possible)
   nk.storageWrite([
     {
       collection: CHIPS_COLLECTION,
@@ -303,6 +474,7 @@ export const claimDailyRewardRpc: nkruntime.RpcFunction = (
       value: { lastClaim: now },
       permissionRead: 1,
       permissionWrite: 0,
+      version: rewardVersion || '*',
     },
   ]);
 
@@ -311,7 +483,7 @@ export const claimDailyRewardRpc: nkruntime.RpcFunction = (
   const response: DailyRewardResponse = {
     rewarded: true,
     amount: DAILY_REWARD_AMOUNT,
-    balance: chipsData.balance,
+    balance: walletResult.balance,
     nextRewardTime: now + REWARD_COOLDOWN_MS,
     message: `You received ${DAILY_REWARD_AMOUNT} chips!`,
   };

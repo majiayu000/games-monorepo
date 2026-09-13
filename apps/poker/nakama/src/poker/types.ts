@@ -80,6 +80,8 @@ export interface Player {
   // Disconnection tracking
   isConnected: boolean;
   disconnectedAt?: number; // Tick when disconnected
+  /** Leave after current hand / cash-out retry — retain seat until wallet credit succeeds */
+  pendingLeave?: boolean;
   // Profile
   avatarUrl?: string;     // Optional custom avatar URL
 }
