@@ -14,16 +14,20 @@ import {
   isAtPendingInviteLimit,
   isBenignStorageDeleteError,
   isInviteVisibleInGetInvites,
+  isStorageVersionConflictError,
   INVITE_HISTORY_CAP,
   INVITE_SECRET_PERMISSION_READ,
   INVITE_SECRET_PERMISSION_WRITE,
   legacyInlineInvitePassword,
+  markInviteSecretCleanupComplete,
+  needsTerminalSecretCleanup,
   parsePasswordFromMatchSignal,
   resolveAcceptInvitePassword,
   shouldBlockCancelForAcceptedReceiver,
   shouldDeleteSecretAfterHistoryCap,
   shouldDeleteSecretAfterSendRollback,
   shouldDeleteSecretAfterTerminalCommit,
+  storageWriteVersionFor,
   withoutInviteId,
   MATCH_SIGNAL_GET_PASSWORD,
 } from '../werewolf/invite-password';
@@ -764,5 +768,143 @@ describe('invite password attachment from matchSignal', () => {
       delete secretStore['inv-partial'];
     }
     expect(secretStore['inv-partial']).toEqual({ password: 'keep-for-join' });
+  });
+
+  it('terminal cleanup marker stops repeated get_invites deletes', () => {
+    const now = Date.now();
+    const invite: GameInvite = {
+      inviteId: 'inv-term',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.DECLINED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+      isPrivate: true,
+    };
+    expect(needsTerminalSecretCleanup(invite, now)).toBe(true);
+    markInviteSecretCleanupComplete(invite);
+    expect(invite.isPrivate).toBe(false);
+    expect(needsTerminalSecretCleanup(invite, now)).toBe(false);
+  });
+
+  it('history cap defers secret deletion until after list commit', () => {
+    const now = Date.now();
+    const secretStore: Record<string, { password: string }> = {};
+    const invites: GameInvite[] = [];
+    for (let i = 0; i < INVITE_HISTORY_CAP + 1; i++) {
+      const inviteId = `inv-cap-${i}`;
+      invites.push({
+        inviteId,
+        matchId: 'm1',
+        roomName: 'Private',
+        senderId: 'host-1',
+        senderName: 'Host',
+        receiverId: `guest-${i}`,
+        receiverName: 'Guest',
+        status: InviteStatus.DECLINED,
+        currentPlayers: 1,
+        maxPlayers: 12,
+        createdAt: i,
+        expiresAt: now + 60_000,
+        isPrivate: true,
+      });
+      secretStore[inviteId] = { password: `pass-${i}` };
+    }
+
+    const dropped = invitesDroppedByHistoryCap(invites);
+    expect(dropped).toHaveLength(1);
+    expect(shouldDeleteSecretAfterHistoryCap(dropped[0], [], now)).toBe(true);
+
+    // Commit capped list first — secret must still exist at this point
+    const committed = invites.slice(-INVITE_HISTORY_CAP).map(inviteForOwnerStorage);
+    expect(committed.some((i) => i.inviteId === 'inv-cap-0')).toBe(false);
+    expect(secretStore['inv-cap-0']).toEqual({ password: 'pass-0' });
+
+    // Only after durable eviction may the secret be deleted
+    for (const drop of dropped) {
+      if (shouldDeleteSecretAfterHistoryCap(drop, [], now)) {
+        delete secretStore[drop.inviteId];
+      }
+    }
+    expect(secretStore['inv-cap-0']).toBeUndefined();
+  });
+
+  it('counterpart read failure must not authorize secret deletion', () => {
+    const now = Date.now();
+    const dropped: GameInvite = {
+      inviteId: 'inv-keep-secret',
+      matchId: 'm1',
+      roomName: 'Private',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: 'guest-1',
+      receiverName: 'Guest',
+      status: InviteStatus.ACCEPTED,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+      isPrivate: true,
+    };
+    // Soft-read [] would wrongly look like "counterpart gone"; callers must
+    // propagate read failures instead of passing an empty fallback list.
+    expect(shouldDeleteSecretAfterHistoryCap(dropped, [], now)).toBe(true);
+    expect(
+      shouldDeleteSecretAfterHistoryCap(dropped, [{ ...dropped }], now)
+    ).toBe(false);
+  });
+
+  it('OCC version helpers encode create-only and conflict detection', () => {
+    expect(storageWriteVersionFor(null)).toBe('*');
+    expect(storageWriteVersionFor('abc123')).toBe('abc123');
+    expect(isStorageVersionConflictError('storage version does not match')).toBe(true);
+    expect(isStorageVersionConflictError('connection reset')).toBe(false);
+  });
+
+  it('atomic pending claim rejects when concurrent writes race past the limit', () => {
+    const now = Date.now();
+    const base: GameInvite[] = Array.from({ length: INVITE_CONFIG.MAX_PENDING - 1 }, (_, i) => ({
+      inviteId: `inv-slot-${i}`,
+      matchId: 'm1',
+      roomName: 'Room',
+      senderId: 'host-1',
+      senderName: 'Host',
+      receiverId: `guest-${i}`,
+      receiverName: 'Guest',
+      status: InviteStatus.PENDING,
+      currentPlayers: 1,
+      maxPlayers: 12,
+      createdAt: 1,
+      expiresAt: now + 60_000,
+    }));
+    expect(isAtPendingInviteLimit(base, now)).toBe(false);
+
+    // Two concurrent readers both observe capacity; only the first OCC write wins.
+    const claimA = [
+      ...base,
+      {
+        ...base[0],
+        inviteId: 'inv-claim-a',
+        receiverId: 'guest-a',
+      },
+    ];
+    const claimB = [
+      ...base,
+      {
+        ...base[0],
+        inviteId: 'inv-claim-b',
+        receiverId: 'guest-b',
+      },
+    ];
+    expect(isAtPendingInviteLimit(claimA, now)).toBe(true);
+    expect(isAtPendingInviteLimit(claimB, now)).toBe(true);
+    // Loser must treat version conflict as limit exceeded (no secret created yet)
+    expect(isStorageVersionConflictError(new Error('version conflict'))).toBe(true);
   });
 });

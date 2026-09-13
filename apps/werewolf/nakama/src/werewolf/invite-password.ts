@@ -136,6 +136,38 @@ export function withoutInviteId(invites: GameInvite[], inviteId: string): GameIn
 }
 
 /**
+ * Versioned invite list read result. `version` is null when the storage
+ * object does not exist yet (first write should use create-only OCC).
+ */
+export interface InviteListRecord {
+  invites: GameInvite[];
+  version: string | null;
+}
+
+/**
+ * Nakama OCC: missing object → create-only (`*`); otherwise exact version.
+ */
+export function storageWriteVersionFor(expectedVersion: string | null): string {
+  return expectedVersion === null ? '*' : expectedVersion;
+}
+
+/**
+ * Terminal private rows that still need orphan secret cleanup retries.
+ */
+export function needsTerminalSecretCleanup(invite: GameInvite, now: number): boolean {
+  return invite.isPrivate === true && !inviteMayRetainPasswordSecret(invite, now);
+}
+
+/**
+ * After a successful secret delete, clear the private marker so get_invites
+ * polling does not re-issue storageDelete on every refresh.
+ */
+export function markInviteSecretCleanupComplete(invite: GameInvite): void {
+  invite.isPrivate = false;
+  invite.password = undefined;
+}
+
+/**
  * Whether a storageDelete failure is safe to ignore (object already absent).
  * Transient / unknown errors must be propagated so callers can retry.
  */
@@ -150,6 +182,24 @@ export function isBenignStorageDeleteError(error: unknown): boolean {
     message.includes('does not exist') ||
     message.includes('no storage object') ||
     message.includes('storage object not found')
+  );
+}
+
+/**
+ * Nakama conditional write / version mismatch failures.
+ */
+export function isStorageVersionConflictError(error: unknown): boolean {
+  const message = String(error ?? '').toLowerCase();
+  if (!message) {
+    return false;
+  }
+  return (
+    message.includes('version') ||
+    message.includes('concurrent') ||
+    message.includes('occ') ||
+    message.includes('conflict') ||
+    message.includes('does not match') ||
+    message.includes('precondition')
   );
 }
 
