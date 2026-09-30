@@ -1,6 +1,8 @@
 # Games Monorepo
 
-基于 Nakama 游戏服务器的多人在线游戏集合。
+基于 Nakama 游戏服务器与 React 的多人在线游戏集合，包含狼人杀和德州扑克。
+
+[快速开始](#快速开始) · [狼人杀说明](apps/werewolf/README.md) · [狼人杀部署文档](apps/werewolf/DEPLOY.md)
 
 ## 游戏列表
 
@@ -19,19 +21,29 @@
 
 ## 快速开始
 
+需要 Node.js 18+、npm 和 Docker Compose。在仓库根目录选择一款游戏启动；两套后端使用相同宿主机端口，请勿同时启动。
+
+以狼人杀为例：
+
 ```bash
-# 安装依赖
-bun install
+# 安装并构建选定游戏的后端
+cd apps/werewolf/nakama
+npm install
+npm run build
 
-# 启动 Docker (Nakama + CockroachDB)
-docker-compose up -d
+# 在游戏目录启动 Nakama + CockroachDB
+cd ..
+docker compose up -d
 
-# 启动狼人杀前端
-bun run dev:werewolf
-
-# 启动扑克前端
-bun run dev:poker
+# 安装并启动前端
+cd client
+npm install
+npm run dev
 ```
+
+打开 <http://localhost:3000/>。另开终端操作时，请从仓库根目录进入对应目录。
+
+启动扑克时，在以上命令中将 `apps/werewolf` 替换为 `apps/poker`；扑克前端配置的默认端口也是 `3000`。
 
 ## 项目结构
 
@@ -59,7 +71,7 @@ games-monorepo/
 | Nakama API | 7350 |
 | Nakama Console | 7351 |
 | 狼人杀前端 | 3000 |
-| 扑克前端 | 3001 |
+| 扑克前端 | 3000（单独运行） |
 
 ---
 
