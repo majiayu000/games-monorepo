@@ -2,7 +2,7 @@
 
 基于 Nakama 游戏服务器与 React 的多人在线游戏集合，包含狼人杀和德州扑克。
 
-[快速开始](#快速开始) · [狼人杀说明](apps/werewolf/README.md) · [狼人杀部署文档](apps/werewolf/DEPLOY.md)
+[快速开始](#快速开始) · [狼人杀说明](apps/werewolf/README.md) · [扑克玩法与源码](apps/poker/README.md) · [狼人杀部署文档](apps/werewolf/DEPLOY.md)
 
 ## 游戏列表
 
@@ -45,6 +45,13 @@ npm run dev
 
 启动扑克时，在以上命令中将 `apps/werewolf` 替换为 `apps/poker`；扑克前端配置的默认端口也是 `3000`。
 
+## 选择一条源码学习路径
+
+- 狼人杀：从 [角色、流程与操作说明](apps/werewolf/README.md) 进入，再读房间消息与比赛处理。
+- 德州扑克：从 [扑克子项目说明](apps/poker/README.md) 进入，按牌组、牌型评估、下注/边池、牌局状态阅读。
+
+两款客户端的 `useNakama.ts` 当前都将服务地址设为 `localhost:7350`，SSL 为 `false`。同一台机器可按快速开始运行；跨设备或线上访问需要让客户端连接可达的 Nakama 服务。部署静态前端还需要配套后端，不能把静态页面地址当作已可加入的多人房间。
+
 ## 项目结构
 
 ```
@@ -76,3 +83,7 @@ games-monorepo/
 ---
 
 🤖 Generated with Claude Code
+
+## 问题反馈与更新
+
+遇到问题时，请在 [Issues](https://github.com/majiayu000/games-monorepo/issues) 写明浏览器或编辑器版本、所用提交、复现步骤和报错文字。当前源码变化见 [提交记录](https://github.com/majiayu000/games-monorepo/commits/main/)。
